@@ -1,0 +1,18 @@
+# Multi-Database Load Tester (JDBC Version) Requirements
+# Python 3.10+
+
+# JDBC 드라이버 사용을 위한 필수 패키지
+jaydebeapi>=1.2.3
+JPype1>=1.4.1
+
+# 선택사항: 환경 변수 관리
+python-dotenv>=1.0.0
+
+# 참고사항:
+# - JDBC 드라이버 JAR 파일들은 ./jre 디렉터리에 배치해야 합니다
+# - 각 데이터베이스별 필요한 JDBC 드라이버:
+#   * Oracle: ojdbc8.jar 또는 ojdbc11.jar
+#   * Tibero: tibero6-jdbc.jar 또는 tibero7-jdbc.jar
+#   * PostgreSQL: postgresql-42.x.x.jar
+#   * MySQL: mysql-connector-java-8.x.x.jar
+#   * SQL Server: mssql-jdbc-12.x.x.jar
