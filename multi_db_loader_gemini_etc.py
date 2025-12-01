@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
 """
-[Universal Database Load Tester]
-- 지원 DB: Oracle, Tibero, SQL Server, PostgreSQL, MySQL
+[Universal Database Load Tester - JDBC Version]
+- 지원 DB: Oracle, Tibero (JDBC), SQL Server, PostgreSQL, MySQL
 - 기능: 멀티스레드 부하 테스트 (INSERT -> COMMIT -> SELECT 검증)
 - 작성: Windows Server Infrastructure Architect
 - 주의: 실행 시 'LOAD_TEST' 테이블이 초기화(DROP/CREATE) 됩니다.
 
-1. Oracle (oracledb)
-python universal_load_tester.py --db-type oracle --user TEST_USER --password password123 --database "localhost:1521/ORCL" --thread-count 50
+1. Oracle (JDBC)
+python multi_db_loader_gemini_etc.py --db-type oracle --db-host 192.168.0.172 --db-port 1521 --db-name DEV --user app --password app --thread-count 50
 
-2. MySQL(pymysql)
-python universal_load_tester.py --db-type mysql --host localhost --user root --password password123 --database test_db --thread-count 50
-
-3. PostgreSQL (psycopg2)
-python universal_load_tester.py --db-type postgres --database "host=localhost dbname=testdb user=postgres password=secret" --user postgres --password secret --thread-count 50
-
-4. Tibero (ODBC - pyodbc) 전제: Windows ODBC 데이터 원본 관리자 또는 Linux odbc.ini에 TiberoDSN이라는 이름으로 DSN이 등록되어 있어야 합니다.
-python universal_load_tester.py --db-type tibero --dsn-name TiberoDSN --user tibero --password tmax --thread-count 50
-
-5. SQL Server (ODBC - pyodbc)
-python universal_load_tester.py --db-type sqlserver --host 192.168.1.100 --database Master --user sa --password password123 --thread-count 50
-
-
+2. Tibero (JDBC)
+python multi_db_loader_gemini_etc.py --db-type tibero --db-host 192.168.0.140 --db-port 8629 --db-name prod --user app --password app --thread-count 50
 """
 
 import sys
@@ -30,9 +19,19 @@ import logging
 import threading
 import argparse
 import queue
+import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
+
+# JDBC imports
+try:
+    import jaydebeapi
+    import jpype
+    JDBC_AVAILABLE = True
+except ImportError:
+    JDBC_AVAILABLE = False
+    logging.warning("jaydebeapi or jpype not available. JDBC connections will not work.")
 
 # 로깅 설정
 logging.basicConfig(
@@ -43,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger("DBLoadTester")
 
 # -------------------------------------------------------------------------
-# [1] Generic Connection Pool (ODBC/MySQL용 - 내장 풀 없는 경우)
+# [1] Generic Connection Pool (ODBC/MySQL/JDBC용 - 내장 풀 없는 경우)
 # -------------------------------------------------------------------------
 class GenericConnectionPool:
     """스레드 안전 큐(Queue)를 이용한 커스텀 커넥션 풀"""
@@ -126,27 +125,94 @@ class DatabaseAdapter(ABC):
     @abstractmethod
     def verify_transaction(self, conn, row_id: int) -> bool: pass
 
-# --- Oracle ---
+    @abstractmethod
+    def check_and_drop_objects(self, conn): pass
+
+# --- Oracle (JDBC) ---
 class OracleAdapter(DatabaseAdapter):
     def __init__(self, config):
-        import oracledb
-        self.oracledb = oracledb
         super().__init__(config)
+        if not JDBC_AVAILABLE:
+            raise ImportError("jaydebeapi and jpype are required for Oracle JDBC connection")
+        
+        # JDBC 드라이버 경로 설정 (./jre/oracle/ojdbc10.jar)
+        self.jar_path = os.path.join(os.path.dirname(__file__), "jre", "oracle", "ojdbc10.jar")
+        if not os.path.exists(self.jar_path):
+            raise FileNotFoundError(f"JDBC driver not found: {self.jar_path}")
+        
+        # JVM 시작 (이미 시작된 경우 무시)
+        if not jpype.isJVMStarted():
+            # C:\jdk25\bin\server\jvm.dll 사용
+            jvm_path = r"C:\jdk25\bin\server\jvm.dll"
+            if not os.path.exists(jvm_path):
+                logger.warning(f"JVM path not found: {jvm_path}, using default JVM")
+                jvm_path = jpype.getDefaultJVMPath()
+            
+            logger.info(f"Starting JVM with: {jvm_path}")
+            jpype.startJVM(
+                jvm_path,
+                f"-Djava.class.path={self.jar_path}",
+                "-Xmx512m"
+            )
 
     def init_pool(self):
-        if self.config.get('thick_mode', False):
-            try: self.oracledb.init_oracle_client()
-            except: pass
-        
-        self.pool = self.oracledb.create_pool(
-            user=self.config['user'], password=self.config['password'],
-            dsn=self.config['dsn'], min=self.config['min_pool'],
-            max=self.config['max_pool'], increment=1,
-            getmode=self.oracledb.POOL_GETMODE_WAIT
-        )
+        def connector():
+            jdbc_url = f"jdbc:oracle:thin:@{self.config['db_host']}:{self.config['db_port']}:{self.config['db_name']}"
+            logger.info(f"Connecting to Oracle: {jdbc_url}")
+            conn = jaydebeapi.connect(
+                "oracle.jdbc.driver.OracleDriver",
+                jdbc_url,
+                [self.config['user'], self.config['password']],
+                self.jar_path
+            )
+            # JDBC 연결 시 autocommit 비활성화 (명시적 commit 사용)
+            conn.jconn.setAutoCommit(False)
+            logger.debug("Oracle connection created with autocommit=False")
+            return conn
+        self.pool = GenericConnectionPool(connector, self.config['min_pool'], self.config['max_pool'])
 
     def get_connection(self): return self.pool.acquire()
     def release_connection(self, conn): self.pool.release(conn)
+
+    def check_and_drop_objects(self, conn):
+        """테이블과 시퀀스 존재 여부 확인 후 삭제"""
+        cursor = conn.cursor()
+        try:
+            # 테이블 존재 확인
+            cursor.execute("""
+                SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = 'LOAD_TEST'
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            # 시퀀스 존재 확인
+            cursor.execute("""
+                SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = 'LOAD_TEST_SEQ'
+            """)
+            seq_exists = cursor.fetchone()[0] > 0
+            
+            # 테이블이 있으면 삭제
+            if table_exists:
+                logger.info("Dropping existing LOAD_TEST table...")
+                cursor.execute("DROP TABLE LOAD_TEST PURGE")
+                conn.commit()  # 명시적 commit
+                logger.info("LOAD_TEST table dropped successfully")
+            else:
+                logger.info("LOAD_TEST table does not exist, will create new")
+            
+            # 시퀀스가 있으면 삭제
+            if seq_exists:
+                logger.info("Dropping existing LOAD_TEST_SEQ sequence...")
+                cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+                conn.commit()  # 명시적 commit
+                logger.info("LOAD_TEST_SEQ sequence dropped successfully")
+            else:
+                logger.info("LOAD_TEST_SEQ sequence does not exist, will create new")
+                
+        except Exception as e:
+            logger.error(f"Error checking/dropping objects: {e}")
+            conn.rollback()  # 명시적 rollback
+        finally:
+            cursor.close()
 
     def get_ddl_statements(self):
         return [
@@ -160,166 +226,118 @@ class OracleAdapter(DatabaseAdapter):
         ]
 
     def execute_transaction(self, conn, thread_id, iteration):
-        with conn.cursor() as cursor:
-            out_id = cursor.var(self.oracledb.NUMBER)
+        cursor = conn.cursor()
+        try:
+            # INSERT
             cursor.execute("""
                 INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, STATUS)
-                VALUES (LOAD_TEST_SEQ.NEXTVAL, :1, :2, 'ACTIVE')
-                RETURNING ID INTO :3
-            """, [thread_id, f"VAL_{iteration}", out_id])
-            val = out_id.getvalue()
-            conn.commit()
-            return val[0]
-
-    def verify_transaction(self, conn, row_id):
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = :1", [row_id])
-            return cursor.fetchone() is not None
-
-# --- PostgreSQL ---
-class PostgresAdapter(DatabaseAdapter):
-    def __init__(self, config):
-        import psycopg2
-        from psycopg2 import pool
-        self.psycopg2 = psycopg2
-        self.pg_pool_cls = pool.ThreadedConnectionPool
-        super().__init__(config)
-
-    def init_pool(self):
-        self.pool = self.pg_pool_cls(
-            minconn=self.config['min_pool'], maxconn=self.config['max_pool'],
-            dsn=self.config['dsn'], user=self.config.get('user'),
-            password=self.config.get('password')
-        )
-
-    def get_connection(self): return self.pool.getconn()
-    def release_connection(self, conn): self.pool.putconn(conn)
-
-    def get_ddl_statements(self):
-        return ["""
-            CREATE TABLE LOAD_TEST (
-                ID SERIAL PRIMARY KEY,
-                THREAD_ID VARCHAR(50),
-                VALUE_COL VARCHAR(100),
-                CREATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                STATUS VARCHAR(20) DEFAULT 'ACTIVE')
-        """]
-
-    def execute_transaction(self, conn, thread_id, iteration):
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO LOAD_TEST (THREAD_ID, VALUE_COL, STATUS)
-                VALUES (%s, %s, 'ACTIVE') RETURNING ID
+                VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, 'ACTIVE')
             """, (thread_id, f"VAL_{iteration}"))
+            
+            # Get the last inserted ID
+            cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
             val = cursor.fetchone()[0]
-            conn.commit()
-            return val
-
-    def verify_transaction(self, conn, row_id):
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = %s", (row_id,))
-            return cursor.fetchone() is not None
-
-# --- MySQL ---
-class MySQLAdapter(DatabaseAdapter):
-    def __init__(self, config):
-        import pymysql
-        self.pymysql = pymysql
-        super().__init__(config)
-
-    def init_pool(self):
-        def connector():
-            return self.pymysql.connect(
-                host=self.config['host'], user=self.config['user'],
-                password=self.config['password'], database=self.config['database'],
-                port=int(self.config.get('port', 3306)), autocommit=False
-            )
-        self.pool = GenericConnectionPool(connector, self.config['min_pool'], self.config['max_pool'])
-
-    def get_connection(self): return self.pool.acquire()
-    def release_connection(self, conn): self.pool.release(conn)
-
-    def get_ddl_statements(self):
-        return ["""
-            CREATE TABLE LOAD_TEST (
-                ID INT AUTO_INCREMENT PRIMARY KEY,
-                THREAD_ID VARCHAR(50),
-                VALUE_COL VARCHAR(100),
-                CREATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                STATUS VARCHAR(20) DEFAULT 'ACTIVE') ENGINE=InnoDB
-        """]
-
-    def execute_transaction(self, conn, thread_id, iteration):
-        with conn.cursor() as cursor:
-            cursor.execute("INSERT INTO LOAD_TEST (THREAD_ID, VALUE_COL, STATUS) VALUES (%s, %s, 'ACTIVE')", 
-                         (thread_id, f"VAL_{iteration}"))
-            val = cursor.lastrowid
-            conn.commit()
-            return val
-
-    def verify_transaction(self, conn, row_id):
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = %s", (row_id,))
-            return cursor.fetchone() is not None
-
-# --- SQL Server (ODBC) ---
-class SQLServerAdapter(DatabaseAdapter):
-    def __init__(self, config):
-        import pyodbc
-        self.pyodbc = pyodbc
-        super().__init__(config)
-
-    def init_pool(self):
-        def connector():
-            conn_str = (f"DRIVER={{{self.config['driver']}}};SERVER={self.config['host']},{self.config.get('port', 1433)};"
-                        f"DATABASE={self.config['database']};UID={self.config['user']};PWD={self.config['password']}")
-            return self.pyodbc.connect(conn_str)
-        self.pool = GenericConnectionPool(connector, self.config['min_pool'], self.config['max_pool'])
-
-    def get_connection(self): return self.pool.acquire()
-    def release_connection(self, conn): self.pool.release(conn)
-
-    def get_ddl_statements(self):
-        return ["""
-            CREATE TABLE LOAD_TEST (
-                ID INT IDENTITY(1,1) PRIMARY KEY,
-                THREAD_ID VARCHAR(50),
-                VALUE_COL VARCHAR(100),
-                CREATED_AT DATETIME DEFAULT GETDATE(),
-                STATUS VARCHAR(20) DEFAULT 'ACTIVE')
-        """]
-
-    def execute_transaction(self, conn, thread_id, iteration):
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO LOAD_TEST (THREAD_ID, VALUE_COL, STATUS) VALUES (?, ?, 'ACTIVE'); SELECT SCOPE_IDENTITY();", 
-                     (thread_id, f"VAL_{iteration}"))
-        val = int(cursor.fetchone()[0])
-        conn.commit()
-        cursor.close()
-        return val
+            conn.commit()  # 명시적 commit
+            return int(val)
+        except Exception as e:
+            conn.rollback()  # 에러 시 명시적 rollback
+            raise e
+        finally:
+            cursor.close()
 
     def verify_transaction(self, conn, row_id):
         cursor = conn.cursor()
-        cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = ?", (row_id,))
-        res = cursor.fetchone()
-        cursor.close()
-        return res is not None
+        try:
+            cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = ?", (row_id,))
+            return cursor.fetchone() is not None
+        finally:
+            cursor.close()
 
-# --- Tibero (ODBC) ---
+# --- Tibero (JDBC) ---
 class TiberoAdapter(DatabaseAdapter):
     def __init__(self, config):
-        import pyodbc
-        self.pyodbc = pyodbc
         super().__init__(config)
+        if not JDBC_AVAILABLE:
+            raise ImportError("jaydebeapi and jpype are required for Tibero JDBC connection")
+        
+        # JDBC 드라이버 경로 설정 (./jre/tibero/tibero7-jdbc.jar)
+        self.jar_path = os.path.join(os.path.dirname(__file__), "jre", "tibero", "tibero7-jdbc.jar")
+        if not os.path.exists(self.jar_path):
+            raise FileNotFoundError(f"JDBC driver not found: {self.jar_path}")
+        
+        # JVM 시작 (이미 시작된 경우 무시)
+        if not jpype.isJVMStarted():
+            # C:\jdk25\bin\server\jvm.dll 사용
+            jvm_path = r"C:\jdk25\bin\server\jvm.dll"
+            if not os.path.exists(jvm_path):
+                logger.warning(f"JVM path not found: {jvm_path}, using default JVM")
+                jvm_path = jpype.getDefaultJVMPath()
+            
+            logger.info(f"Starting JVM with: {jvm_path}")
+            jpype.startJVM(
+                jvm_path,
+                f"-Djava.class.path={self.jar_path}",
+                "-Xmx512m"
+            )
 
     def init_pool(self):
         def connector():
-            # DSN=TiberoDSN;UID=user;PWD=pass
-            return self.pyodbc.connect(f"DSN={self.config['dsn_name']};UID={self.config['user']};PWD={self.config['password']}")
+            jdbc_url = f"jdbc:tibero:thin:@{self.config['db_host']}:{self.config['db_port']}:{self.config['db_name']}"
+            logger.info(f"Connecting to Tibero: {jdbc_url}")
+            conn = jaydebeapi.connect(
+                "com.tmax.tibero.jdbc.TbDriver",
+                jdbc_url,
+                [self.config['user'], self.config['password']],
+                self.jar_path
+            )
+            # JDBC 연결 시 autocommit 비활성화 (명시적 commit 사용)
+            conn.jconn.setAutoCommit(False)
+            logger.debug("Tibero connection created with autocommit=False")
+            return conn
         self.pool = GenericConnectionPool(connector, self.config['min_pool'], self.config['max_pool'])
 
     def get_connection(self): return self.pool.acquire()
     def release_connection(self, conn): self.pool.release(conn)
+
+    def check_and_drop_objects(self, conn):
+        """테이블과 시퀀스 존재 여부 확인 후 삭제"""
+        cursor = conn.cursor()
+        try:
+            # 테이블 존재 확인
+            cursor.execute("""
+                SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = 'LOAD_TEST'
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            # 시퀀스 존재 확인
+            cursor.execute("""
+                SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = 'LOAD_TEST_SEQ'
+            """)
+            seq_exists = cursor.fetchone()[0] > 0
+            
+            # 테이블이 있으면 삭제
+            if table_exists:
+                logger.info("Dropping existing LOAD_TEST table...")
+                cursor.execute("DROP TABLE LOAD_TEST PURGE")
+                conn.commit()  # 명시적 commit
+                logger.info("LOAD_TEST table dropped successfully")
+            else:
+                logger.info("LOAD_TEST table does not exist, will create new")
+            
+            # 시퀀스가 있으면 삭제
+            if seq_exists:
+                logger.info("Dropping existing LOAD_TEST_SEQ sequence...")
+                cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+                conn.commit()  # 명시적 commit
+                logger.info("LOAD_TEST_SEQ sequence dropped successfully")
+            else:
+                logger.info("LOAD_TEST_SEQ sequence does not exist, will create new")
+                
+        except Exception as e:
+            logger.error(f"Error checking/dropping objects: {e}")
+            conn.rollback()  # 명시적 rollback
+        finally:
+            cursor.close()
 
     def get_ddl_statements(self):
         return [
@@ -334,20 +352,29 @@ class TiberoAdapter(DatabaseAdapter):
 
     def execute_transaction(self, conn, thread_id, iteration):
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, STATUS) VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, 'ACTIVE')", 
-                     (thread_id, f"VAL_{iteration}"))
-        cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
-        val = int(cursor.fetchone()[0])
-        conn.commit()
-        cursor.close()
-        return val
+        try:
+            cursor.execute("""
+                INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, STATUS)
+                VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, 'ACTIVE')
+            """, (thread_id, f"VAL_{iteration}"))
+            
+            cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
+            val = cursor.fetchone()[0]
+            conn.commit()  # 명시적 commit
+            return int(val)
+        except Exception as e:
+            conn.rollback()  # 에러 시 명시적 rollback
+            raise e
+        finally:
+            cursor.close()
 
     def verify_transaction(self, conn, row_id):
         cursor = conn.cursor()
-        cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = ?", (row_id,))
-        res = cursor.fetchone()
-        cursor.close()
-        return res is not None
+        try:
+            cursor.execute("SELECT ID FROM LOAD_TEST WHERE ID = ?", (row_id,))
+            return cursor.fetchone() is not None
+        finally:
+            cursor.close()
 
 # -------------------------------------------------------------------------
 # [3] Main Controller
@@ -359,30 +386,30 @@ class MultiDBLoadTester:
         self.stop_event = threading.Event()
         
         if db_type == 'oracle': self.adapter = OracleAdapter(config)
-        elif db_type == 'mysql': self.adapter = MySQLAdapter(config)
-        elif db_type == 'postgres': self.adapter = PostgresAdapter(config)
-        elif db_type == 'sqlserver': self.adapter = SQLServerAdapter(config)
         elif db_type == 'tibero': self.adapter = TiberoAdapter(config)
         else: raise ValueError(f"Unknown DB Type: {db_type}")
 
     def setup_database(self):
-        logger.info("Initializing Database (Drop/Create)...")
+        logger.info("Initializing Database (Check and Drop/Create if exists)...")
         self.adapter.init_pool()
         conn = self.adapter.get_connection()
         try:
-            cursor = conn.cursor()
-            for sql in ["DROP TABLE LOAD_TEST", "DROP SEQUENCE LOAD_TEST_SEQ"]:
-                try: 
-                    cursor.execute(sql)
-                    conn.commit()
-                except: conn.rollback()
+            # 1. 테이블/시퀀스 존재 확인 및 삭제
+            self.adapter.check_and_drop_objects(conn)
             
+            # 2. 새로 생성
+            cursor = conn.cursor()
             for sql in self.adapter.get_ddl_statements():
                 try: 
+                    logger.info(f"Creating database objects...")
                     cursor.execute(sql)
-                    conn.commit()
-                except Exception as e: logger.error(f"DDL Error: {e}")
+                    conn.commit()  # 명시적 commit
+                    logger.info(f"Database object created successfully")
+                except Exception as e: 
+                    logger.error(f"DDL Error: {e}")
+                    conn.rollback()  # 명시적 rollback
             cursor.close()
+            logger.info("Database setup completed successfully!")
         finally:
             self.adapter.release_connection(conn)
 
@@ -434,21 +461,22 @@ class MultiDBLoadTester:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--db-type', required=True, choices=['oracle', 'mysql', 'postgres', 'sqlserver', 'tibero'])
-    parser.add_argument('--host')
-    parser.add_argument('--port', type=int)
+    parser.add_argument('--db-type', required=True, choices=['oracle', 'tibero'])
+    
+    # JDBC 연결용 파라미터
+    parser.add_argument('--db-host', required=True, help="Database Host")
+    parser.add_argument('--db-port', required=True, type=int, help="Database Port")
+    parser.add_argument('--db-name', required=True, help="Database Name/SID")
+    
+    # 공통 파라미터
     parser.add_argument('--user', required=True)
     parser.add_argument('--password', required=True)
-    parser.add_argument('--database', help="DB Name / SID")
-    parser.add_argument('--dsn-name', help="ODBC DSN Name")
-    parser.add_argument('--driver', default='ODBC Driver 17 for SQL Server')
     parser.add_argument('--thread-count', type=int, default=10)
     parser.add_argument('--duration', type=int, default=60)
-    parser.add_argument('--min-pool', type=int, default=10)
+    parser.add_argument('--min-pool', type=int, default=5)
     parser.add_argument('--max-pool', type=int, default=20)
     
     args = parser.parse_args()
-    cfg = {k:v for k,v in vars(args).items() if k != 'db_type'}
-    cfg['dsn'] = args.database # Alias for some drivers
+    cfg = {k:v for k,v in vars(args).items() if k not in ['db_type']}
     
     MultiDBLoadTester(args.db_type, cfg).run(args.thread_count, args.duration)
