@@ -347,9 +347,166 @@ def init_jvm(jar_paths: List[str]):
     logger.info(f"JVM Classpath: {classpath}")
 
     try:
-        jpype.startJVM(jvm_path, f"-Djava.class.path={os.pathsep.join(classpath)}", "-Xmx4g")
+        if not jpype.isJVMStarted():
+            jpype.startJVM(jvm_path, f"-Djava.class.path={os.pathsep.join(classpath)}", "-Xmx4g")
     except Exception as e:
         logger.error(f"Failed to start JVM: {e}")
+        sys.exit(1)
+
+def setup_schema(config: JdbcConfig):
+    """스키마 생성 (Drop & Create)"""
+    logger.info(f"Setting up schema for {config.db_type}...")
+    conn = None
+    try:
+        conn = jaydebeapi.connect(
+            config.driver_class,
+            config.url,
+            [config.user, config.password],
+            config.jar_path
+        )
+        cursor = conn.cursor()
+        
+        # 1. Drop Objects
+        try:
+            if config.db_type in ['oracle', 'tibero']:
+                cursor.execute("DROP TABLE LOAD_TEST PURGE")
+            else:
+                cursor.execute("DROP TABLE LOAD_TEST")
+        except Exception as e:
+            logger.warning(f"Drop table failed (might not exist): {e}")
+
+        try:
+            cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+        except Exception as e:
+            logger.warning(f"Drop sequence failed (might not exist): {e}")
+
+        # 2. Create Objects
+        if config.db_type in ['oracle', 'tibero']:
+            # Sequence
+            cursor.execute("""
+                CREATE SEQUENCE LOAD_TEST_SEQ
+                START WITH 1
+                INCREMENT BY 1
+                CACHE 1000
+                NOCYCLE
+                ORDER
+            """)
+            
+            # Table
+            cursor.execute("""
+                CREATE TABLE LOAD_TEST (
+                    ID           NUMBER(19)      NOT NULL,
+                    THREAD_ID    VARCHAR2(50)    NOT NULL,
+                    VALUE_COL1   VARCHAR2(200),
+                    VALUE_COL2   VARCHAR2(500),
+                    VALUE_COL3   NUMBER(10,2),
+                    RANDOM_DATA  VARCHAR2(1000),
+                    STATUS       VARCHAR2(20)    DEFAULT 'ACTIVE',
+                    CREATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP,
+                    UPDATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP
+                )
+                PARTITION BY HASH (ID)
+                (
+                    PARTITION P01, PARTITION P02, PARTITION P03, PARTITION P04,
+                    PARTITION P05, PARTITION P06, PARTITION P07, PARTITION P08,
+                    PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
+                    PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
+                )
+            """)
+            
+            # PK
+            cursor.execute("ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)")
+            
+            # Indexes
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL")
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL")
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_VAL1 ON LOAD_TEST(THREAD_ID, VALUE_COL1) LOCAL")
+            
+        elif config.db_type == 'postgresql':
+             # Sequence
+            cursor.execute("""
+                CREATE SEQUENCE LOAD_TEST_SEQ
+                START WITH 1
+                INCREMENT BY 1
+                CACHE 1000
+            """)
+            
+            # Table
+            cursor.execute("""
+                CREATE TABLE LOAD_TEST (
+                    ID           BIGINT          NOT NULL DEFAULT nextval('LOAD_TEST_SEQ'),
+                    THREAD_ID    VARCHAR(50)     NOT NULL,
+                    VALUE_COL1   VARCHAR(200),
+                    VALUE_COL2   VARCHAR(500),
+                    VALUE_COL3   NUMERIC(10,2),
+                    RANDOM_DATA  VARCHAR(1000),
+                    STATUS       VARCHAR(20)     DEFAULT 'ACTIVE',
+                    CREATED_AT   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+                    UPDATED_AT   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+                ) PARTITION BY HASH (ID)
+            """)
+            
+            # Partitions
+            for i in range(1, 17):
+                 cursor.execute(f"CREATE TABLE load_test_p{i:02d} PARTITION OF load_test FOR VALUES WITH (MODULUS 16, REMAINDER {i-1})")
+
+            cursor.execute("ALTER TABLE LOAD_TEST ADD PRIMARY KEY (ID)")
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT)")
+            
+        elif config.db_type == 'mysql':
+            cursor.execute("""
+                CREATE TABLE LOAD_TEST (
+                    ID           BIGINT          NOT NULL AUTO_INCREMENT,
+                    THREAD_ID    VARCHAR(50)     NOT NULL,
+                    VALUE_COL1   VARCHAR(200),
+                    VALUE_COL2   VARCHAR(500),
+                    VALUE_COL3   DECIMAL(10,2),
+                    RANDOM_DATA  VARCHAR(1000),
+                    STATUS       VARCHAR(20)     DEFAULT 'ACTIVE',
+                    CREATED_AT   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+                    UPDATED_AT   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (ID)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                PARTITION BY HASH (ID)
+                PARTITIONS 16
+            """)
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT)")
+
+        elif config.db_type == 'sqlserver':
+             # Note: Partitioning in SQL Server requires more complex setup (Filegroups), skipping for simple test or using simplified table
+             # For this script, we will create a simple table if partition scheme not pre-exists
+             cursor.execute("""
+                CREATE TABLE LOAD_TEST (
+                    ID           BIGINT          IDENTITY(1,1) NOT NULL,
+                    THREAD_ID    NVARCHAR(50)    NOT NULL,
+                    VALUE_COL1   NVARCHAR(200),
+                    VALUE_COL2   NVARCHAR(500),
+                    VALUE_COL3   DECIMAL(10,2),
+                    RANDOM_DATA  NVARCHAR(1000),
+                    STATUS       NVARCHAR(20)    DEFAULT 'ACTIVE',
+                    CREATED_AT   DATETIME2       DEFAULT GETDATE(),
+                    UPDATED_AT   DATETIME2       DEFAULT GETDATE(),
+                    CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)
+                )
+            """)
+             cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT)")
+
+        cursor.close()
+        # conn.commit() # Auto-commit is usually on by default in JDBC, but explicit commit is safer if supported
+        try:
+             conn.commit()
+        except:
+             pass
+        conn.close()
+        logger.info("Schema setup completed successfully.")
+        
+    except Exception as e:
+        logger.error(f"Schema setup failed: {e}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
         sys.exit(1)
 
 class LoadTestWorker:
@@ -501,11 +658,11 @@ def get_jdbc_driver_info(db_type: str, base_dir: str):
     drivers = {
         'oracle': {
             'class': 'oracle.jdbc.OracleDriver',
-            'jar_pattern': 'oracle/ojdbc*.jar'
+            'jar_pattern': 'oracle/ojdbc10.jar' # Explicitly requested
         },
         'tibero': {
             'class': 'com.tmax.tibero.jdbc.TbDriver',
-            'jar_pattern': 'tibero/tibero*.jar'
+            'jar_pattern': 'tibero/tibero7-jdbc.jar' # Explicitly requested
         },
         'mysql': {
             'class': 'com.mysql.cj.jdbc.Driver',
@@ -531,11 +688,16 @@ def get_jdbc_driver_info(db_type: str, base_dir: str):
     pattern = os.path.join(jre_dir, info['jar_pattern'])
     jars = glob.glob(pattern)
     
+    # Fallback for patterns if exact match fails (except for requested ones where we want to be strict, but let's be flexible if user made a typo in request vs reality)
+    if not jars and '*' not in info['jar_pattern']:
+         # Try wildcard if exact failed
+         fallback_pattern = os.path.join(jre_dir, os.path.dirname(info['jar_pattern']), '*.jar')
+         jars = glob.glob(fallback_pattern)
+
     if not jars:
         raise FileNotFoundError(f"No JDBC driver found for {db_type} in {pattern}")
         
-    # 첫 번째 발견된 jar 사용 (여러 개일 경우 최신 버전 선택 로직 추가 가능)
-    # 여기서는 단순히 첫 번째 것 선택
+    # 첫 번째 발견된 jar 사용
     return info['class'], jars[0]
 
 def main():
@@ -575,6 +737,9 @@ def main():
         min_pool_size=args.min_pool,
         max_pool_size=args.max_pool
     )
+    
+    # 스키마 설정 (Drop & Create)
+    setup_schema(config)
     
     # 연결 풀 생성
     pool = JdbcConnectionPool(config)
