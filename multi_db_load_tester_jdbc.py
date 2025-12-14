@@ -595,14 +595,67 @@ def find_jdbc_jar(db_type: str, jre_dir: str = './jre') -> Optional[str]:
 
 
 # ============================================================================
-# JDBC 커넥션 풀 - Enhanced with Monitoring
+# JDBC 커넥션 풀 - Enhanced with Monitoring, Leak Detection, Health Check
 # ============================================================================
+@dataclass
+class PooledConnection:
+    """풀링된 커넥션 래퍼 - 생성 시간 및 획득 시간 추적"""
+    connection: Any
+    created_at: float = field(default_factory=time.time)
+    acquired_at: Optional[float] = None
+    acquired_by: Optional[str] = None
+
+    def mark_acquired(self, thread_name: str = None):
+        """커넥션 획득 시 호출"""
+        self.acquired_at = time.time()
+        self.acquired_by = thread_name or threading.current_thread().name
+
+    def mark_released(self):
+        """커넥션 반환 시 호출"""
+        self.acquired_at = None
+        self.acquired_by = None
+
+    def get_age_seconds(self) -> float:
+        """커넥션 생성 후 경과 시간 (초)"""
+        return time.time() - self.created_at
+
+    def get_acquired_duration_seconds(self) -> Optional[float]:
+        """커넥션 획득 후 경과 시간 (초)"""
+        if self.acquired_at is None:
+            return None
+        return time.time() - self.acquired_at
+
+
 class JDBCConnectionPool:
-    """JDBC 커넥션 풀 - 모니터링 지원"""
+    """JDBC 커넥션 풀 - 모니터링, Leak 감지, Health Check 지원
+
+    주요 기능:
+    - Connection Leak 감지: 오래 사용 중인 커넥션 추적 및 경고
+    - Pool Warm-up: 초기화 시 min_size만큼 커넥션 미리 생성
+    - Max Lifetime: 오래된 커넥션 자동 갱신
+    - Idle Health Check: 유휴 커넥션 주기적 검증
+    """
 
     def __init__(self, jdbc_url: str, driver_class: str, jar_file: str,
                  user: str, password: str, min_size: int, max_size: int,
-                 validation_timeout: int = 5):
+                 validation_timeout: int = 5,
+                 max_lifetime_seconds: int = 1800,
+                 leak_detection_threshold_seconds: int = 60,
+                 idle_check_interval_seconds: int = 30):
+        """
+        Args:
+            jdbc_url: JDBC 연결 URL
+            driver_class: JDBC 드라이버 클래스명
+            jar_file: JDBC JAR 파일 경로
+            user: 데이터베이스 사용자
+            password: 데이터베이스 비밀번호
+            min_size: 최소 풀 크기 (Warm-up 시 생성)
+            max_size: 최대 풀 크기
+            validation_timeout: 커넥션 유효성 검사 타임아웃 (초)
+            max_lifetime_seconds: 커넥션 최대 수명 (초, 기본 30분)
+            leak_detection_threshold_seconds: Leak 감지 임계값 (초, 기본 60초)
+            idle_check_interval_seconds: 유휴 커넥션 검사 주기 (초, 기본 30초)
+        """
         self.jdbc_url = jdbc_url
         self.driver_class = driver_class
         self.jar_file = jar_file
@@ -611,20 +664,56 @@ class JDBCConnectionPool:
         self.min_size = min_size
         self.max_size = max_size
         self.validation_timeout = validation_timeout
+        self.max_lifetime_seconds = max_lifetime_seconds
+        self.leak_detection_threshold_seconds = leak_detection_threshold_seconds
+        self.idle_check_interval_seconds = idle_check_interval_seconds
 
         self.pool = queue.Queue(maxsize=max_size)
         self.current_size = 0
         self.active_count = 0
         self.lock = threading.Lock()
 
+        # Leak 감지용: 현재 사용 중인 커넥션 추적
+        self.active_connections: Dict[int, PooledConnection] = {}
+        self.active_connections_lock = threading.Lock()
+
+        # 통계
+        self.total_created = 0
+        self.total_recycled = 0  # max_lifetime 초과로 재생성된 커넥션 수
+        self.total_leaked_warnings = 0
+
+        # Health Check 스레드
+        self._health_check_thread: Optional[threading.Thread] = None
+        self._health_check_running = False
+
         logger.info(f"Initializing JDBC connection pool (min={min_size}, max={max_size})")
+        logger.info(f"  - Max Lifetime: {max_lifetime_seconds}s")
+        logger.info(f"  - Leak Detection Threshold: {leak_detection_threshold_seconds}s")
+        logger.info(f"  - Idle Check Interval: {idle_check_interval_seconds}s")
         logger.info(f"JDBC URL: {jdbc_url}")
 
-        for _ in range(min_size):
-            self._create_connection()
+        # Pool Warm-up: min_size만큼 커넥션 미리 생성
+        self._warmup_pool()
 
-    def _create_connection(self):
-        """새 커넥션 생성"""
+    def _warmup_pool(self):
+        """Pool Warm-up: 초기화 시 min_size만큼 커넥션 미리 생성"""
+        logger.info(f"[Pool Warm-up] Creating {self.min_size} initial connections...")
+        created = 0
+        for i in range(self.min_size):
+            try:
+                pooled_conn = self._create_connection_internal()
+                if pooled_conn:
+                    self.pool.put(pooled_conn)
+                    created += 1
+            except Exception as e:
+                logger.warning(f"[Pool Warm-up] Failed to create connection {i+1}: {e}")
+        logger.info(f"[Pool Warm-up] Completed. Created {created}/{self.min_size} connections")
+
+        # Health Check 스레드 시작
+        self._start_health_check_thread()
+
+    def _create_connection_internal(self) -> Optional[PooledConnection]:
+        """내부용 커넥션 생성 (PooledConnection 반환)"""
         with self.lock:
             if self.current_size >= self.max_size:
                 return None
@@ -638,21 +727,33 @@ class JDBCConnectionPool:
             )
             conn.jconn.setAutoCommit(False)
 
+            pooled_conn = PooledConnection(connection=conn)
+
             with self.lock:
                 self.current_size += 1
+                self.total_created += 1
 
-            self.pool.put(conn)
-            return conn
+            return pooled_conn
         except Exception as e:
             logger.error(f"Failed to create connection: {e}")
             return None
+
+    def _create_connection(self):
+        """새 커넥션 생성 (하위 호환성 유지)"""
+        pooled_conn = self._create_connection_internal()
+        if pooled_conn:
+            self.pool.put(pooled_conn)
+            return pooled_conn.connection
+        return None
 
     def _validate_connection(self, conn) -> bool:
         """커넥션 유효성 검증"""
         try:
             if conn is None:
                 return False
-            jconn = conn.jconn
+            # PooledConnection인 경우 내부 connection 추출
+            actual_conn = conn.connection if isinstance(conn, PooledConnection) else conn
+            jconn = actual_conn.jconn
             if jconn.isClosed():
                 return False
             if hasattr(jconn, 'isValid'):
@@ -661,89 +762,250 @@ class JDBCConnectionPool:
         except Exception:
             return False
 
+    def _is_connection_expired(self, pooled_conn: PooledConnection) -> bool:
+        """커넥션이 max_lifetime을 초과했는지 확인"""
+        return pooled_conn.get_age_seconds() > self.max_lifetime_seconds
+
+    def _start_health_check_thread(self):
+        """Health Check 스레드 시작"""
+        if self._health_check_thread is not None and self._health_check_thread.is_alive():
+            return
+
+        self._health_check_running = True
+        self._health_check_thread = threading.Thread(
+            target=self._health_check_loop,
+            name="PoolHealthCheck",
+            daemon=True
+        )
+        self._health_check_thread.start()
+        logger.info("[Health Check] Thread started")
+
+    def _health_check_loop(self):
+        """Health Check 메인 루프"""
+        while self._health_check_running:
+            try:
+                time.sleep(self.idle_check_interval_seconds)
+                if not self._health_check_running:
+                    break
+
+                self._check_idle_connections()
+                self._detect_connection_leaks()
+            except Exception as e:
+                logger.error(f"[Health Check] Error: {e}")
+
+    def _check_idle_connections(self):
+        """유휴 커넥션 검증 및 만료된 커넥션 제거"""
+        checked = 0
+        removed = 0
+        recycled = 0
+
+        # 임시 리스트에 유효한 커넥션 보관
+        valid_connections = []
+
+        try:
+            while True:
+                try:
+                    pooled_conn = self.pool.get_nowait()
+                except queue.Empty:
+                    break
+
+                checked += 1
+
+                # Max Lifetime 초과 검사
+                if self._is_connection_expired(pooled_conn):
+                    self._close_pooled_connection(pooled_conn)
+                    recycled += 1
+                    with self.lock:
+                        self.total_recycled += 1
+                    # 새 커넥션 생성
+                    new_conn = self._create_connection_internal()
+                    if new_conn:
+                        valid_connections.append(new_conn)
+                    continue
+
+                # 유효성 검사
+                if self._validate_connection(pooled_conn):
+                    valid_connections.append(pooled_conn)
+                else:
+                    self._close_pooled_connection(pooled_conn)
+                    removed += 1
+
+        finally:
+            # 유효한 커넥션 다시 풀에 추가
+            for conn in valid_connections:
+                try:
+                    self.pool.put_nowait(conn)
+                except queue.Full:
+                    self._close_pooled_connection(conn)
+
+        if removed > 0 or recycled > 0:
+            logger.info(f"[Health Check] Checked: {checked}, Removed: {removed}, Recycled: {recycled}")
+
+    def _detect_connection_leaks(self):
+        """Connection Leak 감지"""
+        leaked_connections = []
+
+        with self.active_connections_lock:
+            for conn_id, pooled_conn in self.active_connections.items():
+                duration = pooled_conn.get_acquired_duration_seconds()
+                if duration and duration > self.leak_detection_threshold_seconds:
+                    leaked_connections.append({
+                        'conn_id': conn_id,
+                        'duration': duration,
+                        'thread': pooled_conn.acquired_by
+                    })
+
+        for leak in leaked_connections:
+            self.total_leaked_warnings += 1
+            logger.warning(
+                f"[Leak Detection] Potential connection leak detected! "
+                f"Connection held for {leak['duration']:.1f}s by thread '{leak['thread']}' "
+                f"(threshold: {self.leak_detection_threshold_seconds}s)"
+            )
+
+    def _close_pooled_connection(self, pooled_conn: PooledConnection):
+        """PooledConnection 종료"""
+        try:
+            if pooled_conn and pooled_conn.connection:
+                pooled_conn.connection.close()
+        except:
+            pass
+        with self.lock:
+            self.current_size = max(0, self.current_size - 1)
+
     def get_pool_stats(self) -> Dict[str, int]:
         """풀 상태 조회"""
         with self.lock:
             return {
                 'pool_total': self.current_size,
                 'pool_active': self.active_count,
-                'pool_idle': self.current_size - self.active_count
+                'pool_idle': self.current_size - self.active_count,
+                'pool_total_created': self.total_created,
+                'pool_recycled': self.total_recycled,
+                'pool_leak_warnings': self.total_leaked_warnings
             }
 
     def acquire(self, timeout: int = 30):
-        """커넥션 획득"""
+        """커넥션 획득
+
+        Returns:
+            연결된 커넥션 객체 (내부적으로 PooledConnection 추적)
+        """
         retry_count = 0
         max_retries = 3
+        thread_name = threading.current_thread().name
 
         while retry_count < max_retries:
             try:
-                conn = self.pool.get(timeout=timeout)
+                pooled_conn = self.pool.get(timeout=timeout)
 
-                if self._validate_connection(conn):
+                # Max Lifetime 초과 시 재생성
+                if self._is_connection_expired(pooled_conn):
+                    self._close_pooled_connection(pooled_conn)
+                    with self.lock:
+                        self.total_recycled += 1
+                    pooled_conn = self._create_connection_internal()
+                    if pooled_conn is None:
+                        retry_count += 1
+                        continue
+
+                if self._validate_connection(pooled_conn):
+                    pooled_conn.mark_acquired(thread_name)
+
+                    # Leak 감지용 추적
+                    conn_id = id(pooled_conn.connection)
+                    with self.active_connections_lock:
+                        self.active_connections[conn_id] = pooled_conn
+
                     with self.lock:
                         self.active_count += 1
-                    return conn
-                else:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                    with self.lock:
-                        self.current_size -= 1
 
-                    self._create_connection()
+                    return pooled_conn.connection
+                else:
+                    self._close_pooled_connection(pooled_conn)
+                    pooled_conn = self._create_connection_internal()
+                    if pooled_conn:
+                        self.pool.put(pooled_conn)
 
             except queue.Empty:
                 with self.lock:
                     if self.current_size < self.max_size:
-                        conn = jaydebeapi.connect(
-                            self.driver_class,
-                            self.jdbc_url,
-                            [self.user, self.password],
-                            self.jar_file
-                        )
-                        conn.jconn.setAutoCommit(False)
-                        self.current_size += 1
-                        self.active_count += 1
-                        return conn
+                        pooled_conn = self._create_connection_internal()
+                        if pooled_conn:
+                            pooled_conn.mark_acquired(thread_name)
+                            conn_id = id(pooled_conn.connection)
+                            with self.active_connections_lock:
+                                self.active_connections[conn_id] = pooled_conn
+                            self.active_count += 1
+                            return pooled_conn.connection
 
                 retry_count += 1
 
-        return self.pool.get(timeout=timeout)
+        # 최종 시도
+        pooled_conn = self.pool.get(timeout=timeout)
+        if pooled_conn:
+            pooled_conn.mark_acquired(thread_name)
+            conn_id = id(pooled_conn.connection)
+            with self.active_connections_lock:
+                self.active_connections[conn_id] = pooled_conn
+            with self.lock:
+                self.active_count += 1
+            return pooled_conn.connection
+        return None
 
     def release(self, conn):
         """커넥션 반환"""
         if conn is None:
             return
 
+        conn_id = id(conn)
+
+        # Leak 감지 추적에서 제거 및 PooledConnection 복구
+        pooled_conn = None
+        with self.active_connections_lock:
+            pooled_conn = self.active_connections.pop(conn_id, None)
+
         with self.lock:
             self.active_count = max(0, self.active_count - 1)
 
+        if pooled_conn is None:
+            # PooledConnection을 찾지 못한 경우 (이전 버전 호환)
+            pooled_conn = PooledConnection(connection=conn)
+
+        pooled_conn.mark_released()
+
         try:
-            if self._validate_connection(conn):
+            # Max Lifetime 초과 검사
+            if self._is_connection_expired(pooled_conn):
+                self._close_pooled_connection(pooled_conn)
+                with self.lock:
+                    self.total_recycled += 1
+                # 새 커넥션 생성하여 풀에 추가
+                new_conn = self._create_connection_internal()
+                if new_conn:
+                    self.pool.put_nowait(new_conn)
+                return
+
+            if self._validate_connection(pooled_conn):
                 if self.pool.qsize() < self.max_size:
-                    self.pool.put_nowait(conn)
+                    self.pool.put_nowait(pooled_conn)
                     return
 
-            try:
-                conn.close()
-            except:
-                pass
-            with self.lock:
-                self.current_size -= 1
+            self._close_pooled_connection(pooled_conn)
 
         except queue.Full:
-            try:
-                conn.close()
-            except:
-                pass
-            with self.lock:
-                self.current_size -= 1
+            self._close_pooled_connection(pooled_conn)
 
     def discard(self, conn):
         """커넥션 폐기"""
         if conn is None:
             return
+
+        conn_id = id(conn)
+
+        # Leak 감지 추적에서 제거
+        with self.active_connections_lock:
+            self.active_connections.pop(conn_id, None)
 
         with self.lock:
             self.active_count = max(0, self.active_count - 1)
@@ -754,17 +1016,34 @@ class JDBCConnectionPool:
             pass
 
         with self.lock:
-            self.current_size -= 1
+            self.current_size = max(0, self.current_size - 1)
 
     def close_all(self):
         """모든 커넥션 종료"""
         logger.info("Closing all connections in pool...")
+
+        # Health Check 스레드 중지
+        self._health_check_running = False
+        if self._health_check_thread and self._health_check_thread.is_alive():
+            self._health_check_thread.join(timeout=5)
+
+        # 풀의 모든 커넥션 종료
         while not self.pool.empty():
             try:
-                conn = self.pool.get_nowait()
-                conn.close()
+                pooled_conn = self.pool.get_nowait()
+                self._close_pooled_connection(pooled_conn)
             except:
                 pass
+
+        # 활성 커넥션 정리
+        with self.active_connections_lock:
+            for conn_id, pooled_conn in list(self.active_connections.items()):
+                try:
+                    pooled_conn.connection.close()
+                except:
+                    pass
+            self.active_connections.clear()
+
         logger.info("All connections closed")
 
 
@@ -873,7 +1152,10 @@ class OracleJDBCAdapter(DatabaseAdapter):
             user=config.user,
             password=config.password,
             min_size=config.min_pool_size,
-            max_size=config.max_pool_size
+            max_size=config.max_pool_size,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds
         )
         return self.pool
 
@@ -1033,7 +1315,10 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['postgresql'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
-            min_size=config.min_pool_size, max_size=config.max_pool_size
+            min_size=config.min_pool_size, max_size=config.max_pool_size,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds
         )
         return self.pool
 
@@ -1153,8 +1438,29 @@ CREATE TABLE load_test (
 # ============================================================================
 # MySQL JDBC 어댑터
 # ============================================================================
+# MySQL 커넥션 풀 크기 제한 상수
+# 이 제한은 MySQL Connector/J의 기본 설정 및 MySQL 서버의 max_connections 설정과 관련됩니다.
+# MySQL 서버의 기본 max_connections는 151이지만, 단일 애플리케이션에서 너무 많은
+# 커넥션을 사용하면 다른 클라이언트의 연결이 거부될 수 있습니다.
+# 또한 MySQL Connector/J의 경우 많은 수의 동시 커넥션에서 성능 저하가 발생할 수 있습니다.
+# 필요시 이 값을 조정할 수 있지만, MySQL 서버의 max_connections 설정도 함께 조정해야 합니다.
+MYSQL_MAX_POOL_SIZE = 32
+
+
 class MySQLJDBCAdapter(DatabaseAdapter):
-    """MySQL JDBC 어댑터"""
+    """MySQL JDBC 어댑터
+
+    Note:
+        MySQL의 커넥션 풀 크기는 MYSQL_MAX_POOL_SIZE(기본 32)로 제한됩니다.
+        이는 다음과 같은 이유로 설정되었습니다:
+        1. MySQL 서버의 기본 max_connections (151)와의 균형
+        2. MySQL Connector/J의 대규모 동시 연결 시 성능 특성
+        3. 단일 애플리케이션이 서버 리소스를 독점하는 것을 방지
+
+        더 많은 커넥션이 필요한 경우:
+        - MySQL 서버의 max_connections 설정을 증가시키세요
+        - MYSQL_MAX_POOL_SIZE 상수를 조정하세요
+    """
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -1166,10 +1472,25 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         jdbc_url = JDBC_DRIVERS['mysql'].url_template.format(
             host=config.host, port=config.port or 3306, database=config.database
         )
+
+        # MySQL 커넥션 풀 크기 제한 적용
+        effective_min = min(config.min_pool_size, MYSQL_MAX_POOL_SIZE)
+        effective_max = min(config.max_pool_size, MYSQL_MAX_POOL_SIZE)
+
+        if config.min_pool_size > MYSQL_MAX_POOL_SIZE or config.max_pool_size > MYSQL_MAX_POOL_SIZE:
+            logger.warning(
+                f"[MySQL] Pool size limited to {MYSQL_MAX_POOL_SIZE} "
+                f"(requested: min={config.min_pool_size}, max={config.max_pool_size}). "
+                f"See MYSQL_MAX_POOL_SIZE constant for details."
+            )
+
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['mysql'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
-            min_size=min(config.min_pool_size, 32), max_size=min(config.max_pool_size, 32)
+            min_size=effective_min, max_size=effective_max,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds
         )
         return self.pool
 
@@ -1305,7 +1626,10 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['sqlserver'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
-            min_size=config.min_pool_size, max_size=config.max_pool_size
+            min_size=config.min_pool_size, max_size=config.max_pool_size,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds
         )
         return self.pool
 
@@ -1442,7 +1766,10 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['tibero'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
-            min_size=config.min_pool_size, max_size=config.max_pool_size
+            min_size=config.min_pool_size, max_size=config.max_pool_size,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds
         )
         return self.pool
 
@@ -1574,7 +1901,23 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 # ============================================================================
 @dataclass
 class DatabaseConfig:
-    """데이터베이스 연결 설정"""
+    """데이터베이스 연결 설정
+
+    Attributes:
+        db_type: 데이터베이스 타입 (oracle, postgresql, mysql, sqlserver, tibero)
+        host: 데이터베이스 호스트
+        user: 데이터베이스 사용자
+        password: 데이터베이스 비밀번호
+        database: 데이터베이스 이름 (PostgreSQL, MySQL, SQL Server)
+        sid: Oracle/Tibero SID
+        port: 포트 번호
+        min_pool_size: 최소 커넥션 풀 크기 (Warm-up 시 생성)
+        max_pool_size: 최대 커넥션 풀 크기
+        jre_dir: JRE/JDBC 드라이버 디렉터리
+        max_lifetime_seconds: 커넥션 최대 수명 (초, 기본 30분)
+        leak_detection_threshold_seconds: Leak 감지 임계값 (초, 기본 60초)
+        idle_check_interval_seconds: 유휴 커넥션 Health Check 주기 (초, 기본 30초)
+    """
     db_type: str
     host: str
     user: str
@@ -1585,6 +1928,10 @@ class DatabaseConfig:
     min_pool_size: int = 100
     max_pool_size: int = 200
     jre_dir: str = './jre'
+    # 커넥션 풀 고급 설정
+    max_lifetime_seconds: int = 1800  # 30분
+    leak_detection_threshold_seconds: int = 60  # 60초
+    idle_check_interval_seconds: int = 30  # 30초
 
 
 # ============================================================================
@@ -2169,6 +2516,14 @@ Examples:
     parser.add_argument('--min-pool-size', type=int, default=100)
     parser.add_argument('--max-pool-size', type=int, default=200)
 
+    # 커넥션 풀 고급 설정
+    parser.add_argument('--max-lifetime', type=int, default=1800,
+                        help='Connection max lifetime in seconds (default: 1800 = 30min)')
+    parser.add_argument('--leak-detection-threshold', type=int, default=60,
+                        help='Leak detection threshold in seconds (default: 60)')
+    parser.add_argument('--idle-check-interval', type=int, default=30,
+                        help='Idle connection health check interval in seconds (default: 30)')
+
     # 테스트 설정
     parser.add_argument('--thread-count', type=int, default=100)
     parser.add_argument('--test-duration', type=int, default=300)
@@ -2215,7 +2570,10 @@ def main():
         database=args.database, sid=args.sid,
         user=args.user, password=args.password,
         min_pool_size=args.min_pool_size, max_pool_size=args.max_pool_size,
-        jre_dir=args.jre_dir
+        jre_dir=args.jre_dir,
+        max_lifetime_seconds=args.max_lifetime,
+        leak_detection_threshold_seconds=args.leak_detection_threshold,
+        idle_check_interval_seconds=args.idle_check_interval
     )
 
     initialize_jvm(args.jre_dir)

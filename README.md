@@ -1,4 +1,4 @@
-# Multi-Database Load Tester v2.0 (JDBC Version)
+# Multi-Database Load Tester v2.1 (JDBC Version)
 
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
@@ -17,6 +17,13 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티�
 - **결과 내보내기**: CSV/JSON 형식 지원
 - **Graceful Shutdown**: Ctrl+C 안전 종료
 - **커넥션 풀 모니터링**: 실시간 풀 상태 확인
+
+### v2.1 신규 기능: 향상된 커넥션 풀 관리
+
+- **Connection Leak 감지**: 오래 사용 중인 커넥션 자동 감지 및 경고
+- **Pool Warm-up**: 초기화 시 min_size 커넥션 미리 생성
+- **Connection Max Lifetime**: 오래된 커넥션 자동 갱신
+- **Idle Health Check**: 유휴 커넥션 주기적 검증 및 정리
 
 ## 시스템 요구사항
 
@@ -119,6 +126,20 @@ python multi_db_load_tester_jdbc.py \
     --thread-count 50
 ```
 
+#### 커넥션 풀 고급 설정 (v2.1 신규)
+
+```bash
+python multi_db_load_tester_jdbc.py \
+    --db-type oracle \
+    --host localhost --port 1521 --sid XEPDB1 \
+    --user test --password pass \
+    --min-pool-size 50 \
+    --max-pool-size 100 \
+    --max-lifetime 1800 \
+    --leak-detection-threshold 60 \
+    --idle-check-interval 30
+```
+
 #### 결과 내보내기
 
 ```bash
@@ -167,6 +188,8 @@ python multi_db_load_tester_jdbc.py \
     --user root --password pass \
     --thread-count 100
 ```
+
+> **Note**: MySQL의 커넥션 풀 크기는 기본적으로 32개로 제한됩니다. 이는 MySQL 서버의 max_connections 설정 및 Connector/J 특성을 고려한 것입니다. 자세한 내용은 소스 코드의 `MYSQL_MAX_POOL_SIZE` 상수를 참조하세요.
 
 #### SQL Server
 ```bash
@@ -242,8 +265,16 @@ python multi_db_load_tester_jdbc.py \
 
 | 옵션 | 기본값 | 설명 |
 |------|--------|------|
-| `--min-pool-size` | 100 | 최소 풀 크기 |
+| `--min-pool-size` | 100 | 최소 풀 크기 (Warm-up 시 생성) |
 | `--max-pool-size` | 200 | 최대 풀 크기 |
+
+### 커넥션 풀 고급 설정 (v2.1 신규)
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--max-lifetime` | 1800 | 커넥션 최대 수명 (초, 30분) |
+| `--leak-detection-threshold` | 60 | Leak 감지 임계값 (초) |
+| `--idle-check-interval` | 30 | 유휴 커넥션 Health Check 주기 (초) |
 
 ### 기타
 
@@ -251,6 +282,54 @@ python multi_db_load_tester_jdbc.py \
 |------|------|
 | `--print-ddl` | DDL 스크립트 출력 후 종료 |
 | `--log-level` | 로그 레벨 (DEBUG, INFO, WARNING, ERROR) |
+
+## 커넥션 풀 관리 (v2.1 신규)
+
+### Pool Warm-up
+
+초기화 시 `min_size`만큼 커넥션을 미리 생성하여 첫 번째 요청부터 최적의 성능을 제공합니다.
+
+```
+[Pool Warm-up] Creating 100 initial connections...
+[Pool Warm-up] Completed. Created 100/100 connections
+```
+
+### Connection Leak 감지
+
+커넥션이 `leak_detection_threshold` 시간 이상 반환되지 않으면 경고를 출력합니다:
+
+```
+[Leak Detection] Potential connection leak detected!
+Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
+```
+
+### Connection Max Lifetime
+
+`max_lifetime` 시간이 지난 커넥션은 자동으로 폐기되고 새 커넥션으로 교체됩니다. 이는 데이터베이스 서버의 유휴 연결 타임아웃 문제를 방지합니다.
+
+### Idle Health Check
+
+백그라운드 스레드가 `idle_check_interval` 주기로 유휴 커넥션을 검증합니다:
+- 유효하지 않은 커넥션 자동 제거
+- 만료된 커넥션 갱신
+- 커넥션 풀 상태 유지
+
+```
+[Health Check] Checked: 50, Removed: 2, Recycled: 3
+```
+
+### 확장된 풀 통계
+
+```python
+{
+    'pool_total': 100,           # 현재 총 커넥션 수
+    'pool_active': 50,           # 사용 중인 커넥션 수
+    'pool_idle': 50,             # 유휴 커넥션 수
+    'pool_total_created': 120,   # 총 생성된 커넥션 수
+    'pool_recycled': 20,         # 재생성된 커넥션 수
+    'pool_leak_warnings': 0      # Leak 경고 횟수
+}
+```
 
 ## 모니터링 출력 예시
 
@@ -315,13 +394,31 @@ Lat(avg/p50/p95/p99): 2.1/1.8/4.5/8.2ms | Pool: 95/100 | Elapsed: 30.0s
 
 ## 데이터베이스별 특징
 
-| DB | 드라이버 | PK 생성 | 파티셔닝 |
-|----|---------|---------|----------|
-| Oracle | ojdbc | SEQUENCE | HASH 16개 |
-| PostgreSQL | postgresql | BIGSERIAL | HASH 16개 |
-| MySQL | mysql-connector | AUTO_INCREMENT | HASH 16개 |
-| SQL Server | mssql-jdbc | IDENTITY | - |
-| Tibero | tibero-jdbc | SEQUENCE | HASH 16개 |
+| DB | 드라이버 | PK 생성 | 파티셔닝 | 풀 제한 |
+|----|---------|---------|----------|---------|
+| Oracle | ojdbc | SEQUENCE | HASH 16개 | - |
+| PostgreSQL | postgresql | BIGSERIAL | HASH 16개 | - |
+| MySQL | mysql-connector | AUTO_INCREMENT | HASH 16개 | 최대 32개 |
+| SQL Server | mssql-jdbc | IDENTITY | - | - |
+| Tibero | tibero-jdbc | SEQUENCE | HASH 16개 | - |
+
+## 환경 변수 설정
+
+`env.example` 파일을 `.env`로 복사하여 설정할 수 있습니다:
+
+```bash
+# 공통 부하 테스트 설정
+MIN_POOL_SIZE=100
+MAX_POOL_SIZE=200
+THREAD_COUNT=200
+TEST_DURATION=300
+LOG_LEVEL=INFO
+
+# 커넥션 풀 고급 설정 (선택사항)
+MAX_LIFETIME_SECONDS=1800
+LEAK_DETECTION_THRESHOLD_SECONDS=60
+IDLE_CHECK_INTERVAL_SECONDS=30
+```
 
 ## 실행 스크립트
 
@@ -342,8 +439,9 @@ chmod +x run_*.sh
 테스트 중 `Ctrl+C`를 누르면 안전하게 종료됩니다:
 1. 모든 워커 스레드에 종료 신호 전송
 2. 진행 중인 트랜잭션 완료 대기
-3. 커넥션 풀 정리
-4. 최종 통계 출력 및 결과 저장
+3. Health Check 스레드 종료
+4. 커넥션 풀 정리 (활성/유휴 커넥션 모두)
+5. 최종 통계 출력 및 결과 저장
 
 ## 문제 해결
 
@@ -359,10 +457,20 @@ chmod +x run_*.sh
 - `--max-pool-size` 값 증가
 - 데이터베이스 max_connections 설정 확인
 
+### Connection Leak 경고 발생
+- 트랜잭션 처리 시간이 `--leak-detection-threshold` 초과
+- 긴 트랜잭션이 예상되는 경우 임계값 증가
+- 실제 Leak인 경우 코드 검토 필요
+
 ### TPS가 목표치에 도달하지 않음
 - `--thread-count` 증가
 - `--target-tps` 설정 확인 (0으로 설정 시 무제한)
 - 데이터베이스 리소스 확인
+
+### MySQL 풀 크기 제한
+- MySQL은 기본적으로 최대 32개 커넥션으로 제한됨
+- 더 많은 커넥션이 필요한 경우 `MYSQL_MAX_POOL_SIZE` 상수 조정
+- MySQL 서버의 `max_connections` 설정도 함께 조정 필요
 
 ## 라이선스
 
