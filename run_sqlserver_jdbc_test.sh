@@ -1,12 +1,12 @@
 #!/bin/bash
-# PostgreSQL JDBC Load Test Script
+# SQL Server JDBC Load Test Script
 
 # Configuration
-DB_TYPE="postgresql"
+DB_TYPE="sqlserver"
 HOST="localhost"
-PORT=5432
+PORT=1433
 DATABASE="testdb"
-USER="test_user"
+USER="sa"
 PASSWORD="your_password"
 THREAD_COUNT=200
 TEST_DURATION=300
@@ -16,14 +16,14 @@ MODE="full"  # full, insert-only, select-only
 JRE_DIR="./jre"
 
 # Check JDBC driver
-echo "Checking PostgreSQL JDBC driver..."
-if ! ls ./jre/postgresql/postgresql-*.jar 1> /dev/null 2>&1; then
-    echo "ERROR: PostgreSQL JDBC driver not found in ./jre/postgresql/"
-    echo "Download from: https://jdbc.postgresql.org/download/"
+echo "Checking SQL Server JDBC driver..."
+if ! ls ./jre/sqlserver/mssql-jdbc-*.jar 1> /dev/null 2>&1; then
+    echo "ERROR: SQL Server JDBC driver not found in ./jre/sqlserver/"
+    echo "Download from: https://docs.microsoft.com/en-us/sql/connect/jdbc/download-microsoft-jdbc-driver-for-sql-server"
     exit 1
 fi
 
-echo "Starting PostgreSQL JDBC load test (mode: ${MODE})..."
+echo "Starting SQL Server JDBC load test (mode: ${MODE})..."
 
 python multi_db_load_tester_jdbc.py \
     --db-type ${DB_TYPE} \

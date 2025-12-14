@@ -1,29 +1,29 @@
 #!/bin/bash
-# PostgreSQL JDBC Load Test Script
+# MySQL JDBC Load Test Script
 
 # Configuration
-DB_TYPE="postgresql"
+DB_TYPE="mysql"
 HOST="localhost"
-PORT=5432
+PORT=3306
 DATABASE="testdb"
-USER="test_user"
+USER="root"
 PASSWORD="your_password"
-THREAD_COUNT=200
+THREAD_COUNT=100
 TEST_DURATION=300
-MIN_POOL_SIZE=100
-MAX_POOL_SIZE=200
+MIN_POOL_SIZE=30
+MAX_POOL_SIZE=32  # MySQL pool limit
 MODE="full"  # full, insert-only, select-only
 JRE_DIR="./jre"
 
 # Check JDBC driver
-echo "Checking PostgreSQL JDBC driver..."
-if ! ls ./jre/postgresql/postgresql-*.jar 1> /dev/null 2>&1; then
-    echo "ERROR: PostgreSQL JDBC driver not found in ./jre/postgresql/"
-    echo "Download from: https://jdbc.postgresql.org/download/"
+echo "Checking MySQL JDBC driver..."
+if ! ls ./jre/mysql/mysql-connector-*.jar 1> /dev/null 2>&1; then
+    echo "ERROR: MySQL JDBC driver not found in ./jre/mysql/"
+    echo "Download from: https://dev.mysql.com/downloads/connector/j/"
     exit 1
 fi
 
-echo "Starting PostgreSQL JDBC load test (mode: ${MODE})..."
+echo "Starting MySQL JDBC load test (mode: ${MODE})..."
 
 python multi_db_load_tester_jdbc.py \
     --db-type ${DB_TYPE} \

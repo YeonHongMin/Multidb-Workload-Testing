@@ -1,11 +1,11 @@
 #!/bin/bash
-# PostgreSQL JDBC Load Test Script
+# Tibero JDBC Load Test Script
 
 # Configuration
-DB_TYPE="postgresql"
+DB_TYPE="tibero"
 HOST="localhost"
-PORT=5432
-DATABASE="testdb"
+PORT=8629
+SID="tibero"
 USER="test_user"
 PASSWORD="your_password"
 THREAD_COUNT=200
@@ -16,20 +16,20 @@ MODE="full"  # full, insert-only, select-only
 JRE_DIR="./jre"
 
 # Check JDBC driver
-echo "Checking PostgreSQL JDBC driver..."
-if ! ls ./jre/postgresql/postgresql-*.jar 1> /dev/null 2>&1; then
-    echo "ERROR: PostgreSQL JDBC driver not found in ./jre/postgresql/"
-    echo "Download from: https://jdbc.postgresql.org/download/"
+echo "Checking Tibero JDBC driver..."
+if ! ls ./jre/tibero/tibero*jdbc*.jar 1> /dev/null 2>&1; then
+    echo "ERROR: Tibero JDBC driver not found in ./jre/tibero/"
+    echo "Copy tibero7-jdbc.jar from Tibero installation"
     exit 1
 fi
 
-echo "Starting PostgreSQL JDBC load test (mode: ${MODE})..."
+echo "Starting Tibero JDBC load test (mode: ${MODE})..."
 
 python multi_db_load_tester_jdbc.py \
     --db-type ${DB_TYPE} \
     --host ${HOST} \
     --port ${PORT} \
-    --database ${DATABASE} \
+    --sid ${SID} \
     --user ${USER} \
     --password ${PASSWORD} \
     --thread-count ${THREAD_COUNT} \

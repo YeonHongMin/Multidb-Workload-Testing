@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용)
+멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.0
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 
 특징:
@@ -10,6 +10,36 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 - INSERT -> COMMIT -> SELECT 검증 패턴
 - 자동 에러 복구 및 커넥션 재연결
 - 실시간 성능 모니터링 (TPS, 에러 카운트)
+- **1초 이내 트랜잭션량 측정 (Sub-second Metrics)**
+- **작업 모드 선택 (insert-only, select-only, update-only, delete-only, mixed, full)**
+- **결과 내보내기 (CSV/JSON)**
+- **워밍업 기간 설정**
+- **Graceful Shutdown (Ctrl+C)**
+- **배치 INSERT 지원**
+- **목표 TPS 제한 (Rate Limiting)**
+- **점진적 부하 증가 (Ramp-up)**
+- **커넥션 풀 상태 모니터링**
+
+Usage Examples:
+  # Full mode (INSERT -> COMMIT -> SELECT)
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --mode full
+
+  # Insert-only with batch size
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --mode insert-only --batch-size 100
+
+  # With warmup, ramp-up, and rate limiting
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --warmup 30 --ramp-up 60 --target-tps 1000
+
+  # Export results to CSV/JSON
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --output-format csv --output-file results.csv
 """
 
 import sys
@@ -21,10 +51,15 @@ import random
 import string
 import os
 import glob
+import platform
+import signal
+import json
+import csv
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import queue
 
@@ -51,57 +86,378 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 성능 카운터 (Thread-Safe)
+# 작업 모드 정의
+# ============================================================================
+class WorkMode:
+    """작업 모드 상수"""
+    FULL = 'full'                # INSERT -> COMMIT -> SELECT (기본)
+    INSERT_ONLY = 'insert-only'  # INSERT -> COMMIT만
+    SELECT_ONLY = 'select-only'  # SELECT만 (기존 데이터 필요)
+    UPDATE_ONLY = 'update-only'  # UPDATE만 (기존 데이터 필요)
+    DELETE_ONLY = 'delete-only'  # DELETE만 (기존 데이터 필요)
+    MIXED = 'mixed'              # INSERT/UPDATE/DELETE/SELECT 혼합
+
+
+# ============================================================================
+# Graceful Shutdown Handler
+# ============================================================================
+class GracefulShutdown:
+    """Graceful Shutdown 핸들러"""
+
+    def __init__(self):
+        self.shutdown_requested = False
+        self.lock = threading.Lock()
+
+        # 시그널 핸들러 등록
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        with self.lock:
+            if not self.shutdown_requested:
+                self.shutdown_requested = True
+                logger.info("\n[Shutdown] Graceful shutdown requested. Finishing current transactions...")
+
+    def is_shutdown_requested(self) -> bool:
+        with self.lock:
+            return self.shutdown_requested
+
+    def request_shutdown(self):
+        with self.lock:
+            self.shutdown_requested = True
+
+
+# 전역 shutdown 핸들러
+shutdown_handler: Optional[GracefulShutdown] = None
+
+
+# ============================================================================
+# 성능 카운터 (Thread-Safe) - Enhanced with Sub-second Metrics
 # ============================================================================
 class PerformanceCounter:
-    """스레드 안전 성능 카운터"""
-    
-    def __init__(self):
+    """스레드 안전 성능 카운터 - 1초 이내 측정 지원"""
+
+    def __init__(self, sub_second_window_ms: int = 100):
         self.lock = threading.Lock()
         self.total_inserts = 0
         self.total_selects = 0
+        self.total_updates = 0
+        self.total_deletes = 0
+        self.total_transactions = 0
         self.total_errors = 0
         self.verification_failures = 0
         self.connection_recreates = 0
         self.start_time = time.time()
-        
-    def increment_insert(self):
+
+        # 워밍업 관련
+        self.warmup_end_time: Optional[float] = None
+        self.post_warmup_transactions = 0
+        self.post_warmup_start_time: Optional[float] = None
+
+        # Sub-second 측정
+        self.sub_second_window_ms = sub_second_window_ms
+        self.sub_second_window_sec = sub_second_window_ms / 1000.0
+        self.recent_transactions: deque = deque()
+        self.recent_lock = threading.Lock()
+
+        # 레이턴시 측정
+        self.latencies: deque = deque(maxlen=10000)
+        self.latency_lock = threading.Lock()
+
+        # 구간별 통계
+        self.last_check_time = time.time()
+        self.last_transactions = 0
+
+        # 시계열 데이터 (결과 내보내기용)
+        self.time_series: List[Dict[str, Any]] = []
+        self.time_series_lock = threading.Lock()
+
+    def set_warmup_end_time(self, warmup_end_time: float):
+        """워밍업 종료 시간 설정"""
+        self.warmup_end_time = warmup_end_time
+
+    def is_warmup_period(self) -> bool:
+        """워밍업 기간인지 확인"""
+        if self.warmup_end_time is None:
+            return False
+        return time.time() < self.warmup_end_time
+
+    def record_transaction(self, latency_ms: float = 0):
+        """트랜잭션 완료 기록"""
+        current_time = time.time()
+
         with self.lock:
-            self.total_inserts += 1
-    
+            self.total_transactions += 1
+
+            # 워밍업 이후 통계
+            if self.warmup_end_time and current_time >= self.warmup_end_time:
+                if self.post_warmup_start_time is None:
+                    self.post_warmup_start_time = current_time
+                self.post_warmup_transactions += 1
+
+        with self.recent_lock:
+            self.recent_transactions.append(current_time)
+            cutoff = current_time - 1.0
+            while self.recent_transactions and self.recent_transactions[0] < cutoff:
+                self.recent_transactions.popleft()
+
+        if latency_ms > 0:
+            with self.latency_lock:
+                self.latencies.append(latency_ms)
+
+    def increment_insert(self, count: int = 1):
+        with self.lock:
+            self.total_inserts += count
+
     def increment_select(self):
         with self.lock:
             self.total_selects += 1
-    
+
+    def increment_update(self):
+        with self.lock:
+            self.total_updates += 1
+
+    def increment_delete(self):
+        with self.lock:
+            self.total_deletes += 1
+
     def increment_error(self):
         with self.lock:
             self.total_errors += 1
-    
+
     def increment_verification_failure(self):
         with self.lock:
             self.verification_failures += 1
-    
+
     def increment_connection_recreate(self):
         with self.lock:
             self.connection_recreates += 1
-    
+
+    def get_sub_second_tps(self) -> float:
+        """최근 1초간의 TPS"""
+        current_time = time.time()
+
+        with self.recent_lock:
+            cutoff = current_time - 1.0
+            while self.recent_transactions and self.recent_transactions[0] < cutoff:
+                self.recent_transactions.popleft()
+            count = len(self.recent_transactions)
+
+        return float(count)
+
+    def get_windowed_tps(self, window_ms: int = None) -> float:
+        """지정된 윈도우 내 TPS"""
+        if window_ms is None:
+            window_ms = self.sub_second_window_ms
+
+        window_sec = window_ms / 1000.0
+        current_time = time.time()
+        cutoff = current_time - window_sec
+
+        with self.recent_lock:
+            count = sum(1 for t in self.recent_transactions if t >= cutoff)
+
+        return count / window_sec if window_sec > 0 else 0.0
+
+    def get_latency_stats(self) -> Dict[str, float]:
+        """레이턴시 통계"""
+        with self.latency_lock:
+            if not self.latencies:
+                return {'avg': 0, 'p50': 0, 'p95': 0, 'p99': 0, 'min': 0, 'max': 0}
+
+            sorted_latencies = sorted(self.latencies)
+            n = len(sorted_latencies)
+
+            return {
+                'avg': sum(sorted_latencies) / n,
+                'p50': sorted_latencies[int(n * 0.50)],
+                'p95': sorted_latencies[int(n * 0.95)] if n > 20 else sorted_latencies[-1],
+                'p99': sorted_latencies[int(n * 0.99)] if n > 100 else sorted_latencies[-1],
+                'min': sorted_latencies[0],
+                'max': sorted_latencies[-1]
+            }
+
+    def get_interval_stats(self) -> Dict[str, Any]:
+        """구간별 통계"""
+        current_time = time.time()
+
+        with self.lock:
+            interval_time = current_time - self.last_check_time
+            interval_transactions = self.total_transactions - self.last_transactions
+
+            self.last_check_time = current_time
+            self.last_transactions = self.total_transactions
+
+            interval_tps = interval_transactions / interval_time if interval_time > 0 else 0
+
+            return {
+                'interval_seconds': interval_time,
+                'interval_transactions': interval_transactions,
+                'interval_tps': round(interval_tps, 2)
+            }
+
+    def record_time_series(self, pool_stats: Dict[str, int] = None):
+        """시계열 데이터 기록"""
+        current_time = time.time()
+        stats = self.get_stats()
+        latency_stats = self.get_latency_stats()
+
+        record = {
+            'timestamp': datetime.now().isoformat(),
+            'elapsed_seconds': round(current_time - self.start_time, 2),
+            'total_transactions': stats['total_transactions'],
+            'total_inserts': stats['total_inserts'],
+            'total_selects': stats['total_selects'],
+            'total_updates': stats['total_updates'],
+            'total_deletes': stats['total_deletes'],
+            'total_errors': stats['total_errors'],
+            'realtime_tps': stats['realtime_tps'],
+            'avg_tps': stats['avg_tps'],
+            'latency_avg': round(latency_stats['avg'], 2),
+            'latency_p95': round(latency_stats['p95'], 2),
+            'latency_p99': round(latency_stats['p99'], 2),
+            'is_warmup': self.is_warmup_period()
+        }
+
+        if pool_stats:
+            record.update(pool_stats)
+
+        with self.time_series_lock:
+            self.time_series.append(record)
+
     def get_stats(self) -> Dict[str, Any]:
+        """전체 통계"""
         with self.lock:
             elapsed_time = time.time() - self.start_time
-            tps = self.total_inserts / elapsed_time if elapsed_time > 0 else 0
+            avg_tps = self.total_transactions / elapsed_time if elapsed_time > 0 else 0
+
+            # 워밍업 후 통계
+            post_warmup_tps = 0
+            if self.post_warmup_start_time:
+                post_warmup_elapsed = time.time() - self.post_warmup_start_time
+                post_warmup_tps = self.post_warmup_transactions / post_warmup_elapsed if post_warmup_elapsed > 0 else 0
+
             return {
                 'total_inserts': self.total_inserts,
                 'total_selects': self.total_selects,
+                'total_updates': self.total_updates,
+                'total_deletes': self.total_deletes,
+                'total_transactions': self.total_transactions,
                 'total_errors': self.total_errors,
                 'verification_failures': self.verification_failures,
                 'connection_recreates': self.connection_recreates,
                 'elapsed_seconds': elapsed_time,
-                'tps': round(tps, 2)
+                'avg_tps': round(avg_tps, 2),
+                'realtime_tps': round(self.get_sub_second_tps(), 2),
+                'post_warmup_transactions': self.post_warmup_transactions,
+                'post_warmup_tps': round(post_warmup_tps, 2)
             }
 
 
 # 전역 성능 카운터
-perf_counter = PerformanceCounter()
+perf_counter: Optional[PerformanceCounter] = None
+
+
+# ============================================================================
+# Rate Limiter (Token Bucket Algorithm)
+# ============================================================================
+class RateLimiter:
+    """Token Bucket 기반 Rate Limiter"""
+
+    def __init__(self, target_tps: int):
+        self.target_tps = target_tps
+        self.tokens = target_tps
+        self.max_tokens = target_tps * 2  # 버스트 허용
+        self.last_refill = time.time()
+        self.lock = threading.Lock()
+
+        if target_tps <= 0:
+            self.enabled = False
+        else:
+            self.enabled = True
+
+    def acquire(self, timeout: float = 1.0) -> bool:
+        """토큰 획득 (Rate Limiting)"""
+        if not self.enabled:
+            return True
+
+        start_time = time.time()
+
+        while True:
+            with self.lock:
+                # 토큰 리필
+                now = time.time()
+                elapsed = now - self.last_refill
+                refill_amount = elapsed * self.target_tps
+                self.tokens = min(self.max_tokens, self.tokens + refill_amount)
+                self.last_refill = now
+
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return True
+
+            # 타임아웃 체크
+            if time.time() - start_time > timeout:
+                return False
+
+            # 짧은 대기
+            time.sleep(0.001)
+
+
+# ============================================================================
+# 결과 내보내기
+# ============================================================================
+class ResultExporter:
+    """테스트 결과 내보내기"""
+
+    @staticmethod
+    def export_csv(filepath: str, stats: Dict[str, Any], time_series: List[Dict],
+                   config: Dict[str, Any]):
+        """CSV 형식으로 내보내기"""
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+
+            # 설정 정보
+            writer.writerow(['# Configuration'])
+            for key, value in config.items():
+                writer.writerow([f'# {key}', value])
+            writer.writerow([])
+
+            # 최종 통계
+            writer.writerow(['# Final Statistics'])
+            for key, value in stats.items():
+                writer.writerow([f'# {key}', value])
+            writer.writerow([])
+
+            # 시계열 데이터
+            if time_series:
+                writer.writerow(['# Time Series Data'])
+                headers = list(time_series[0].keys())
+                writer.writerow(headers)
+                for record in time_series:
+                    writer.writerow([record.get(h, '') for h in headers])
+
+        logger.info(f"Results exported to CSV: {filepath}")
+
+    @staticmethod
+    def export_json(filepath: str, stats: Dict[str, Any], time_series: List[Dict],
+                    config: Dict[str, Any], latency_stats: Dict[str, float]):
+        """JSON 형식으로 내보내기"""
+        result = {
+            'test_info': {
+                'timestamp': datetime.now().isoformat(),
+                'version': '2.0'
+            },
+            'configuration': config,
+            'final_statistics': stats,
+            'latency_statistics': latency_stats,
+            'time_series': time_series
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Results exported to JSON: {filepath}")
 
 
 # ============================================================================
@@ -118,7 +474,7 @@ class JDBCDriverInfo:
 JDBC_DRIVERS = {
     'oracle': JDBCDriverInfo(
         driver_class='oracle.jdbc.OracleDriver',
-        jar_pattern='ojdbc10.jar',
+        jar_pattern='ojdbc*.jar',
         url_template='jdbc:oracle:thin:@{host}:{port}:{sid}'
     ),
     'tibero': JDBCDriverInfo(
@@ -144,42 +500,64 @@ JDBC_DRIVERS = {
 }
 
 
+def get_jvm_path() -> str:
+    """크로스 플랫폼 JVM 경로 찾기"""
+    system = platform.system().lower()
+    java_home = os.environ.get('JAVA_HOME', '')
+
+    if system == 'windows':
+        possible_paths = [
+            r"C:\jdk25\bin\server\jvm.dll",
+            os.path.join(java_home, 'bin', 'server', 'jvm.dll') if java_home else '',
+            os.path.join(java_home, 'jre', 'bin', 'server', 'jvm.dll') if java_home else '',
+        ]
+    elif system == 'darwin':
+        possible_paths = [
+            '/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/lib/server/libjvm.dylib',
+            '/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home/lib/server/libjvm.dylib',
+            os.path.join(java_home, 'lib', 'server', 'libjvm.dylib') if java_home else '',
+        ]
+    else:
+        possible_paths = [
+            '/usr/lib/jvm/java-21-openjdk/lib/server/libjvm.so',
+            '/usr/lib/jvm/java-17-openjdk/lib/server/libjvm.so',
+            os.path.join(java_home, 'lib', 'server', 'libjvm.so') if java_home else '',
+        ]
+
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            return path
+
+    try:
+        return jpype.getDefaultJVMPath()
+    except Exception:
+        raise RuntimeError("JVM path not found. Set JAVA_HOME or install Java.")
+
+
 def initialize_jvm(jre_dir: str = './jre'):
-    """JVM 초기화 (C:\\jdk25 사용)"""
+    """JVM 초기화"""
     if jpype.isJVMStarted():
         return
 
-    # 사용자 지정 JDK 경로
-    jdk_path = r"C:\jdk25"
-    jvm_path = os.path.join(jdk_path, "bin", "server", "jvm.dll")
-    
-    if not os.path.exists(jvm_path):
-        logger.warning(f"JVM DLL not found at {jvm_path}, trying default...")
-        jvm_path = jpype.getDefaultJVMPath()
-    
+    jvm_path = get_jvm_path()
     logger.info(f"Initializing JVM using: {jvm_path}")
-    
-    # Build Classpath
+
     jars = []
     for root, dirs, files in os.walk(jre_dir):
         for file in files:
             if file.endswith('.jar'):
                 jars.append(os.path.join(root, file))
-    
-    classpath = os.pathsep.join(jars)
-    if not classpath:
-        classpath = "."
-        
+
+    classpath = os.pathsep.join(jars) or "."
     logger.info(f"JVM Classpath: {classpath}")
-    
-    # JVM 옵션 설정
+
     jvm_args = [
         f"-Djava.class.path={classpath}",
         "-Dfile.encoding=UTF-8",
         "-Xms512m",
         "-Xmx2048m"
     ]
-    
+
     try:
         jpype.startJVM(jvm_path, *jvm_args)
         logger.info("JVM initialized successfully")
@@ -189,33 +567,42 @@ def initialize_jvm(jre_dir: str = './jre'):
 
 
 def find_jdbc_jar(db_type: str, jre_dir: str = './jre') -> Optional[str]:
-    """./jre 디렉터리에서 JDBC JAR 파일 찾기"""
+    """JDBC JAR 파일 찾기"""
     if db_type not in JDBC_DRIVERS:
         raise ValueError(f"Unsupported DB type: {db_type}")
-    
+
     driver_info = JDBC_DRIVERS[db_type]
+
+    db_subdir = os.path.join(jre_dir, db_type)
+    if os.path.exists(db_subdir):
+        pattern = os.path.join(db_subdir, driver_info.jar_pattern)
+        jar_files = glob.glob(pattern)
+        if jar_files:
+            jar_file = sorted(jar_files)[-1]
+            logger.info(f"Found JDBC driver: {jar_file}")
+            return jar_file
+
     pattern = os.path.join(jre_dir, '**', driver_info.jar_pattern)
-    
     jar_files = glob.glob(pattern, recursive=True)
-    
+
     if not jar_files:
         logger.error(f"JDBC driver not found: {driver_info.jar_pattern} in {jre_dir}")
         return None
-    
-    # 여러 개 있으면 가장 최신 버전 사용
+
     jar_file = sorted(jar_files)[-1]
     logger.info(f"Found JDBC driver: {jar_file}")
     return jar_file
 
 
 # ============================================================================
-# JDBC 커넥션 풀 (Queue 기반)
+# JDBC 커넥션 풀 - Enhanced with Monitoring
 # ============================================================================
 class JDBCConnectionPool:
-    """JDBC 커넥션 풀"""
-    
-    def __init__(self, jdbc_url: str, driver_class: str, jar_file: str, 
-                 user: str, password: str, min_size: int, max_size: int):
+    """JDBC 커넥션 풀 - 모니터링 지원"""
+
+    def __init__(self, jdbc_url: str, driver_class: str, jar_file: str,
+                 user: str, password: str, min_size: int, max_size: int,
+                 validation_timeout: int = 5):
         self.jdbc_url = jdbc_url
         self.driver_class = driver_class
         self.jar_file = jar_file
@@ -223,80 +610,128 @@ class JDBCConnectionPool:
         self.password = password
         self.min_size = min_size
         self.max_size = max_size
-        
+        self.validation_timeout = validation_timeout
+
         self.pool = queue.Queue(maxsize=max_size)
         self.current_size = 0
+        self.active_count = 0
         self.lock = threading.Lock()
-        
+
         logger.info(f"Initializing JDBC connection pool (min={min_size}, max={max_size})")
         logger.info(f"JDBC URL: {jdbc_url}")
-        logger.info(f"Driver Class: {driver_class}")
-        logger.info(f"JAR File: {jar_file}")
-        
-        # 초기 커넥션 생성
+
         for _ in range(min_size):
             self._create_connection()
-    
+
     def _create_connection(self):
-        """새 JDBC 커넥션 생성"""
+        """새 커넥션 생성"""
         with self.lock:
             if self.current_size >= self.max_size:
-                return
-            
-            try:
-                conn = jaydebeapi.connect(
-                    self.driver_class,
-                    self.jdbc_url,
-                    [self.user, self.password],
-                    self.jar_file
-                )
-                conn.jconn.setAutoCommit(False)  # 명시적 커밋
-                self.pool.put(conn)
+                return None
+
+        try:
+            conn = jaydebeapi.connect(
+                self.driver_class,
+                self.jdbc_url,
+                [self.user, self.password],
+                self.jar_file
+            )
+            conn.jconn.setAutoCommit(False)
+
+            with self.lock:
                 self.current_size += 1
-                logger.debug(f"Created new connection. Pool size: {self.current_size}")
-            except Exception as e:
-                logger.error(f"Failed to create connection: {e}")
-    
+
+            self.pool.put(conn)
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to create connection: {e}")
+            return None
+
+    def _validate_connection(self, conn) -> bool:
+        """커넥션 유효성 검증"""
+        try:
+            if conn is None:
+                return False
+            jconn = conn.jconn
+            if jconn.isClosed():
+                return False
+            if hasattr(jconn, 'isValid'):
+                return jconn.isValid(self.validation_timeout)
+            return True
+        except Exception:
+            return False
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        """풀 상태 조회"""
+        with self.lock:
+            return {
+                'pool_total': self.current_size,
+                'pool_active': self.active_count,
+                'pool_idle': self.current_size - self.active_count
+            }
+
     def acquire(self, timeout: int = 30):
         """커넥션 획득"""
-        try:
-            conn = self.pool.get(timeout=timeout)
-            return conn
-        except queue.Empty:
-            # 풀이 비어있고 최대 크기 미만이면 새로 생성
-            with self.lock:
-                if self.current_size < self.max_size:
-                    conn = jaydebeapi.connect(
-                        self.driver_class,
-                        self.jdbc_url,
-                        [self.user, self.password],
-                        self.jar_file
-                    )
-                    conn.jconn.setAutoCommit(False)
-                    self.current_size += 1
-                    logger.debug(f"Created connection on demand. Pool size: {self.current_size}")
+        retry_count = 0
+        max_retries = 3
+
+        while retry_count < max_retries:
+            try:
+                conn = self.pool.get(timeout=timeout)
+
+                if self._validate_connection(conn):
+                    with self.lock:
+                        self.active_count += 1
                     return conn
-            
-            # 생성 불가능하면 다시 대기
-            return self.pool.get(timeout=timeout)
-    
+                else:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    with self.lock:
+                        self.current_size -= 1
+
+                    self._create_connection()
+
+            except queue.Empty:
+                with self.lock:
+                    if self.current_size < self.max_size:
+                        conn = jaydebeapi.connect(
+                            self.driver_class,
+                            self.jdbc_url,
+                            [self.user, self.password],
+                            self.jar_file
+                        )
+                        conn.jconn.setAutoCommit(False)
+                        self.current_size += 1
+                        self.active_count += 1
+                        return conn
+
+                retry_count += 1
+
+        return self.pool.get(timeout=timeout)
+
     def release(self, conn):
         """커넥션 반환"""
         if conn is None:
             return
-        
+
+        with self.lock:
+            self.active_count = max(0, self.active_count - 1)
+
         try:
-            # 풀이 가득 차지 않았으면 반환
-            if self.pool.qsize() < self.max_size:
-                self.pool.put_nowait(conn)
-            else:
-                # 풀이 가득 찼으면 연결 종료
-                try:
-                    conn.close()
-                except:
-                    pass
-                with self.lock:
-                    self.current_size -= 1
+            if self._validate_connection(conn):
+                if self.pool.qsize() < self.max_size:
+                    self.pool.put_nowait(conn)
+                    return
+
+            try:
+                conn.close()
+            except:
+                pass
+            with self.lock:
+                self.current_size -= 1
+
         except queue.Full:
             try:
                 conn.close()
@@ -304,7 +739,23 @@ class JDBCConnectionPool:
                 pass
             with self.lock:
                 self.current_size -= 1
-    
+
+    def discard(self, conn):
+        """커넥션 폐기"""
+        if conn is None:
+            return
+
+        with self.lock:
+            self.active_count = max(0, self.active_count - 1)
+
+        try:
+            conn.close()
+        except:
+            pass
+
+        with self.lock:
+            self.current_size -= 1
+
     def close_all(self):
         """모든 커넥션 종료"""
         logger.info("Closing all connections in pool...")
@@ -322,55 +773,77 @@ class JDBCConnectionPool:
 # ============================================================================
 class DatabaseAdapter(ABC):
     """데이터베이스 공통 인터페이스"""
-    
+
     @abstractmethod
     def create_connection_pool(self, config: 'DatabaseConfig'):
-        """커넥션 풀 생성"""
         pass
-    
+
     @abstractmethod
     def get_connection(self):
-        """커넥션 획득"""
         pass
-    
+
     @abstractmethod
     def release_connection(self, connection, is_error: bool = False):
-        """커넥션 반환"""
         pass
-    
+
+    @abstractmethod
+    def discard_connection(self, connection):
+        pass
+
     @abstractmethod
     def close_pool(self):
-        """풀 종료"""
         pass
-    
+
+    @abstractmethod
+    def get_pool_stats(self) -> Dict[str, int]:
+        pass
+
     @abstractmethod
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """INSERT 실행 후 생성된 ID 반환"""
         pass
-    
+
+    @abstractmethod
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        pass
+
     @abstractmethod
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
-        """SELECT 실행"""
         pass
-    
+
+    @abstractmethod
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        pass
+
+    @abstractmethod
+    def execute_update(self, cursor, record_id: int) -> bool:
+        pass
+
+    @abstractmethod
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        pass
+
+    @abstractmethod
+    def get_max_id(self, cursor) -> int:
+        pass
+
+    @abstractmethod
+    def get_random_id(self, cursor, max_id: int) -> int:
+        pass
+
     @abstractmethod
     def commit(self, connection):
-        """트랜잭션 커밋"""
         pass
-    
+
     @abstractmethod
     def rollback(self, connection):
-        """트랜잭션 롤백"""
         pass
-    
+
     @abstractmethod
     def get_ddl(self) -> str:
-        """DDL 스크립트 반환"""
         pass
 
     @abstractmethod
     def setup_schema(self, connection):
-        """스키마 설정 (Drop & Create)"""
         pass
 
 
@@ -379,21 +852,20 @@ class DatabaseAdapter(ABC):
 # ============================================================================
 class OracleJDBCAdapter(DatabaseAdapter):
     """Oracle JDBC 어댑터"""
-    
+
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
         self.jar_file = find_jdbc_jar('oracle', jre_dir)
         if not self.jar_file:
-            raise RuntimeError("Oracle JDBC driver not found in ./jre directory")
-    
+            raise RuntimeError("Oracle JDBC driver not found")
+
     def create_connection_pool(self, config: 'DatabaseConfig'):
-        # JDBC URL 생성
         jdbc_url = JDBC_DRIVERS['oracle'].url_template.format(
             host=config.host,
             port=config.port or 1521,
             sid=config.sid or config.database
         )
-        
+
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url,
             driver_class=JDBC_DRIVERS['oracle'].driver_class,
@@ -403,50 +875,93 @@ class OracleJDBCAdapter(DatabaseAdapter):
             min_size=config.min_pool_size,
             max_size=config.max_pool_size
         )
-        
         return self.pool
-    
+
     def get_connection(self):
         return self.pool.acquire()
-    
+
     def release_connection(self, connection, is_error: bool = False):
         if connection:
             try:
                 if is_error:
                     connection.rollback()
                 self.pool.release(connection)
-            except Exception as e:
-                logger.debug(f"Error releasing connection: {e}")
-    
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
-    
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """Oracle INSERT with SEQUENCE"""
-        # RETURNING 구문을 사용하지 않고 CURRVAL로 조회
         cursor.execute("""
             INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
             VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
         """, [thread_id, f'TEST_{thread_id}', random_data])
-        
+
         cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
         result = cursor.fetchone()
         return int(result[0])
-    
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행"""
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
+                VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+
+        return batch_size
+
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.fetchone()
-    
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute("""
+            UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = SYSTIMESTAMP WHERE ID = ?
+        """, [f'UPDATED_{record_id}', record_id])
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT NVL(MAX(ID), 0) FROM LOAD_TEST")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        if max_id <= 0:
+            return 0
+        return random.randint(1, max_id)
+
     def commit(self, connection):
         connection.commit()
-    
+
     def rollback(self, connection):
         try:
             connection.rollback()
         except:
             pass
-    
+
     def get_ddl(self) -> str:
         return """
 -- Oracle DDL
@@ -460,69 +975,38 @@ CREATE TABLE LOAD_TEST (
     CREATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP,
     UPDATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP
 )
-PARTITION BY HASH (ID)
-(
-    PARTITION P01, PARTITION P02, PARTITION P03, PARTITION P04,
-    PARTITION P05, PARTITION P06, PARTITION P07, PARTITION P08,
-    PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
-    PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
-)
+PARTITION BY HASH (ID) PARTITIONS 16
 TABLESPACE USERS
 ENABLE ROW MOVEMENT;
 ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
-CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL;
 """
 
     def setup_schema(self, connection):
-        """Oracle 스키마 설정"""
         cursor = connection.cursor()
         try:
-            # Drop Sequence
             try:
                 cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
-                logger.info("Dropped existing sequence LOAD_TEST_SEQ")
-            except Exception:
-                logger.info("Sequence LOAD_TEST_SEQ does not exist, skipping drop")
-
-            # Drop Table
+            except:
+                pass
             try:
                 cursor.execute("DROP TABLE LOAD_TEST PURGE")
-                logger.info("Dropped existing table LOAD_TEST")
-            except Exception:
-                logger.info("Table LOAD_TEST does not exist, skipping drop")
+            except:
+                pass
 
-            # Create Sequence
             cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
-            
-            # Create Table
             cursor.execute("""
                 CREATE TABLE LOAD_TEST (
-                    ID           NUMBER(19)      NOT NULL,
-                    THREAD_ID    VARCHAR2(50)    NOT NULL,
-                    VALUE_COL    VARCHAR2(200),
-                    RANDOM_DATA  VARCHAR2(1000),
-                    STATUS       VARCHAR2(20)    DEFAULT 'ACTIVE',
-                    CREATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP,
-                    UPDATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP
-                )
-                PARTITION BY HASH (ID)
-                (
-                    PARTITION P01, PARTITION P02, PARTITION P03, PARTITION P04,
-                    PARTITION P05, PARTITION P06, PARTITION P07, PARTITION P08,
-                    PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
-                    PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
-                )
-                TABLESPACE USERS
-                ENABLE ROW MOVEMENT
+                    ID NUMBER(19) NOT NULL, THREAD_ID VARCHAR2(50) NOT NULL,
+                    VALUE_COL VARCHAR2(200), RANDOM_DATA VARCHAR2(1000),
+                    STATUS VARCHAR2(20) DEFAULT 'ACTIVE',
+                    CREATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP,
+                    UPDATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP
+                ) PARTITION BY HASH (ID) PARTITIONS 16 TABLESPACE USERS ENABLE ROW MOVEMENT
             """)
-            
             cursor.execute("ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)")
             cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL")
-            cursor.execute("CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL")
-            
             logger.info("Oracle schema created successfully")
-            
         except Exception as e:
             logger.error(f"Failed to setup Oracle schema: {e}")
             raise
@@ -535,111 +1019,129 @@ CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL;
 # ============================================================================
 class PostgreSQLJDBCAdapter(DatabaseAdapter):
     """PostgreSQL JDBC 어댑터"""
-    
+
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
         self.jar_file = find_jdbc_jar('postgresql', jre_dir)
         if not self.jar_file:
-            raise RuntimeError("PostgreSQL JDBC driver not found in ./jre directory")
-    
+            raise RuntimeError("PostgreSQL JDBC driver not found")
+
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['postgresql'].url_template.format(
-            host=config.host,
-            port=config.port or 5432,
-            database=config.database
+            host=config.host, port=config.port or 5432, database=config.database
         )
-        
         self.pool = JDBCConnectionPool(
-            jdbc_url=jdbc_url,
-            driver_class=JDBC_DRIVERS['postgresql'].driver_class,
-            jar_file=self.jar_file,
-            user=config.user,
-            password=config.password,
-            min_size=config.min_pool_size,
-            max_size=config.max_pool_size
+            jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['postgresql'].driver_class,
+            jar_file=self.jar_file, user=config.user, password=config.password,
+            min_size=config.min_pool_size, max_size=config.max_pool_size
         )
-        
         return self.pool
-    
+
     def get_connection(self):
         return self.pool.acquire()
-    
+
     def release_connection(self, connection, is_error: bool = False):
         if connection:
             try:
                 if is_error:
                     connection.rollback()
                 self.pool.release(connection)
-            except Exception as e:
-                logger.debug(f"Error releasing connection: {e}")
-    
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
-    
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """PostgreSQL INSERT with RETURNING"""
         cursor.execute("""
             INSERT INTO load_test (thread_id, value_col, random_data, created_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            RETURNING id
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP) RETURNING id
         """, [thread_id, f'TEST_{thread_id}', random_data])
-        
         result = cursor.fetchone()
         return int(result[0])
-    
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO load_test (thread_id, value_col, random_data, created_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+        return batch_size
+
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
-    
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute("UPDATE load_test SET value_col = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                       [f'UPDATED_{record_id}', record_id])
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT COALESCE(MAX(id), 0) FROM load_test")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        return random.randint(1, max_id) if max_id > 0 else 0
+
     def commit(self, connection):
         connection.commit()
-    
+
     def rollback(self, connection):
         try:
             connection.rollback()
         except:
             pass
-    
+
     def get_ddl(self) -> str:
         return """
 -- PostgreSQL DDL
 CREATE TABLE load_test (
-    id           BIGSERIAL       PRIMARY KEY,
-    thread_id    VARCHAR(50)     NOT NULL,
-    value_col    VARCHAR(200),
-    random_data  VARCHAR(1000),
-    status       VARCHAR(20)     DEFAULT 'ACTIVE',
-    created_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+    id BIGSERIAL PRIMARY KEY, thread_id VARCHAR(50) NOT NULL,
+    value_col VARCHAR(200), random_data VARCHAR(1000),
+    status VARCHAR(20) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) PARTITION BY HASH (id);
--- Partitions omitted for brevity
 """
 
     def setup_schema(self, connection):
-        """PostgreSQL 스키마 설정"""
         cursor = connection.cursor()
         try:
             cursor.execute("DROP TABLE IF EXISTS load_test CASCADE")
-            
             cursor.execute("""
                 CREATE TABLE load_test (
-                    id           BIGSERIAL       PRIMARY KEY,
-                    thread_id    VARCHAR(50)     NOT NULL,
-                    value_col    VARCHAR(200),
-                    random_data  VARCHAR(1000),
-                    status       VARCHAR(20)     DEFAULT 'ACTIVE',
-                    created_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-                    updated_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+                    id BIGSERIAL PRIMARY KEY, thread_id VARCHAR(50) NOT NULL,
+                    value_col VARCHAR(200), random_data VARCHAR(1000),
+                    status VARCHAR(20) DEFAULT 'ACTIVE',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) PARTITION BY HASH (id)
             """)
-            
             for i in range(16):
                 cursor.execute(f"CREATE TABLE load_test_p{i:02d} PARTITION OF load_test FOR VALUES WITH (MODULUS 16, REMAINDER {i})")
-            
             cursor.execute("CREATE INDEX idx_load_test_thread ON load_test(thread_id, created_at)")
-            cursor.execute("CREATE INDEX idx_load_test_created ON load_test(created_at)")
-            
             logger.info("PostgreSQL schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup PostgreSQL schema: {e}")
@@ -653,113 +1155,129 @@ CREATE TABLE load_test (
 # ============================================================================
 class MySQLJDBCAdapter(DatabaseAdapter):
     """MySQL JDBC 어댑터"""
-    
+
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
         self.jar_file = find_jdbc_jar('mysql', jre_dir)
         if not self.jar_file:
-            raise RuntimeError("MySQL JDBC driver not found in ./jre directory")
-    
+            raise RuntimeError("MySQL JDBC driver not found")
+
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['mysql'].url_template.format(
-            host=config.host,
-            port=config.port or 3306,
-            database=config.database
+            host=config.host, port=config.port or 3306, database=config.database
         )
-        
         self.pool = JDBCConnectionPool(
-            jdbc_url=jdbc_url,
-            driver_class=JDBC_DRIVERS['mysql'].driver_class,
-            jar_file=self.jar_file,
-            user=config.user,
-            password=config.password,
-            min_size=min(config.min_pool_size, 32),
-            max_size=min(config.max_pool_size, 32)  # MySQL 제한
+            jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['mysql'].driver_class,
+            jar_file=self.jar_file, user=config.user, password=config.password,
+            min_size=min(config.min_pool_size, 32), max_size=min(config.max_pool_size, 32)
         )
-        
         return self.pool
-    
+
     def get_connection(self):
         return self.pool.acquire()
-    
+
     def release_connection(self, connection, is_error: bool = False):
         if connection:
             try:
                 if is_error:
                     connection.rollback()
                 self.pool.release(connection)
-            except Exception as e:
-                logger.debug(f"Error releasing connection: {e}")
-    
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
-    
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """MySQL INSERT with AUTO_INCREMENT"""
         cursor.execute("""
             INSERT INTO load_test (thread_id, value_col, random_data, created_at)
             VALUES (?, ?, ?, NOW())
         """, [thread_id, f'TEST_{thread_id}', random_data])
-        
         cursor.execute("SELECT LAST_INSERT_ID()")
         result = cursor.fetchone()
         return int(result[0])
-    
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO load_test (thread_id, value_col, random_data, created_at)
+                VALUES (?, ?, ?, NOW())
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+        return batch_size
+
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
-    
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute("UPDATE load_test SET value_col = ? WHERE id = ?", [f'UPDATED_{record_id}', record_id])
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT IFNULL(MAX(id), 0) FROM load_test")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        return random.randint(1, max_id) if max_id > 0 else 0
+
     def commit(self, connection):
         connection.commit()
-    
+
     def rollback(self, connection):
         try:
             connection.rollback()
         except:
             pass
-    
+
     def get_ddl(self) -> str:
         return """
 -- MySQL DDL
 CREATE TABLE load_test (
-    id           BIGINT          NOT NULL AUTO_INCREMENT,
-    thread_id    VARCHAR(50)     NOT NULL,
-    value_col    VARCHAR(200),
-    random_data  VARCHAR(1000),
-    status       VARCHAR(20)     DEFAULT 'ACTIVE',
-    created_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    id BIGINT NOT NULL AUTO_INCREMENT, thread_id VARCHAR(50) NOT NULL,
+    value_col VARCHAR(200), random_data VARCHAR(1000),
+    status VARCHAR(20) DEFAULT 'ACTIVE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id)
-) ENGINE=InnoDB
-PARTITION BY HASH(id)
-PARTITIONS 16;
+) ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 16;
 """
 
     def setup_schema(self, connection):
-        """MySQL 스키마 설정"""
         cursor = connection.cursor()
         try:
             cursor.execute("DROP TABLE IF EXISTS load_test")
-            
             cursor.execute("""
                 CREATE TABLE load_test (
-                    id           BIGINT          NOT NULL AUTO_INCREMENT,
-                    thread_id    VARCHAR(50)     NOT NULL,
-                    value_col    VARCHAR(200),
-                    random_data  VARCHAR(1000),
-                    status       VARCHAR(20)     DEFAULT 'ACTIVE',
-                    created_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-                    updated_at   TIMESTAMP       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    id BIGINT NOT NULL AUTO_INCREMENT, thread_id VARCHAR(50) NOT NULL,
+                    value_col VARCHAR(200), random_data VARCHAR(1000),
+                    status VARCHAR(20) DEFAULT 'ACTIVE',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (id)
-                ) ENGINE=InnoDB
-                PARTITION BY HASH(id)
-                PARTITIONS 16
+                ) ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 16
             """)
-            
             cursor.execute("CREATE INDEX idx_load_test_thread ON load_test(thread_id, created_at)")
-            cursor.execute("CREATE INDEX idx_load_test_created ON load_test(created_at)")
-            
             logger.info("MySQL schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup MySQL schema: {e}")
@@ -773,102 +1291,127 @@ PARTITIONS 16;
 # ============================================================================
 class SQLServerJDBCAdapter(DatabaseAdapter):
     """SQL Server JDBC 어댑터"""
-    
+
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
         self.jar_file = find_jdbc_jar('sqlserver', jre_dir)
         if not self.jar_file:
-            raise RuntimeError("SQL Server JDBC driver not found in ./jre directory")
-    
+            raise RuntimeError("SQL Server JDBC driver not found")
+
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['sqlserver'].url_template.format(
-            host=config.host,
-            port=config.port or 1433,
-            database=config.database
+            host=config.host, port=config.port or 1433, database=config.database
         )
-        
         self.pool = JDBCConnectionPool(
-            jdbc_url=jdbc_url,
-            driver_class=JDBC_DRIVERS['sqlserver'].driver_class,
-            jar_file=self.jar_file,
-            user=config.user,
-            password=config.password,
-            min_size=config.min_pool_size,
-            max_size=config.max_pool_size
+            jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['sqlserver'].driver_class,
+            jar_file=self.jar_file, user=config.user, password=config.password,
+            min_size=config.min_pool_size, max_size=config.max_pool_size
         )
-        
         return self.pool
-    
+
     def get_connection(self):
         return self.pool.acquire()
-    
+
     def release_connection(self, connection, is_error: bool = False):
         if connection:
             try:
                 if is_error:
                     connection.rollback()
                 self.pool.release(connection)
-            except Exception as e:
-                logger.debug(f"Error releasing connection: {e}")
-    
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
-    
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """SQL Server INSERT with IDENTITY"""
         cursor.execute("""
             INSERT INTO load_test (thread_id, value_col, random_data, created_at)
             VALUES (?, ?, ?, GETDATE())
         """, [thread_id, f'TEST_{thread_id}', random_data])
-        
         cursor.execute("SELECT SCOPE_IDENTITY()")
         result = cursor.fetchone()
         return int(result[0])
-    
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO load_test (thread_id, value_col, random_data, created_at)
+                VALUES (?, ?, ?, GETDATE())
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+        return batch_size
+
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
-    
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute("UPDATE load_test SET value_col = ?, updated_at = GETDATE() WHERE id = ?",
+                       [f'UPDATED_{record_id}', record_id])
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT ISNULL(MAX(id), 0) FROM load_test")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        return random.randint(1, max_id) if max_id > 0 else 0
+
     def commit(self, connection):
         connection.commit()
-    
+
     def rollback(self, connection):
         try:
             connection.rollback()
         except:
             pass
-    
+
     def get_ddl(self) -> str:
         return """
 -- SQL Server DDL
--- (Omitted for brevity)
+CREATE TABLE load_test (
+    id BIGINT IDENTITY(1,1) NOT NULL, thread_id NVARCHAR(50) NOT NULL,
+    value_col NVARCHAR(200), random_data NVARCHAR(1000),
+    status NVARCHAR(20) DEFAULT 'ACTIVE',
+    created_at DATETIME2 DEFAULT GETDATE(), updated_at DATETIME2 DEFAULT GETDATE(),
+    CONSTRAINT PK_load_test PRIMARY KEY CLUSTERED (id)
+);
 """
 
     def setup_schema(self, connection):
-        """SQL Server 스키마 설정"""
         cursor = connection.cursor()
         try:
-            # Drop Table
             try:
                 cursor.execute("DROP TABLE load_test")
             except:
                 pass
-                
-            # Drop Partition Scheme/Function if exists (Complex in SQL Server, skipping for now or simple drop)
-            # For simplicity, just creating table without partitioning if failed, or try full setup
-            
-            # ... Implementation simplified for this request as user focused on Oracle/Tibero
-            # But adding basic Create
             cursor.execute("""
                 CREATE TABLE load_test (
-                    id           BIGINT         IDENTITY(1,1) NOT NULL,
-                    thread_id    NVARCHAR(50)   NOT NULL,
-                    value_col    NVARCHAR(200),
-                    random_data  NVARCHAR(1000),
-                    status       NVARCHAR(20)   DEFAULT 'ACTIVE',
-                    created_at   DATETIME2      DEFAULT GETDATE(),
-                    updated_at   DATETIME2      DEFAULT GETDATE(),
+                    id BIGINT IDENTITY(1,1) NOT NULL, thread_id NVARCHAR(50) NOT NULL,
+                    value_col NVARCHAR(200), random_data NVARCHAR(1000),
+                    status NVARCHAR(20) DEFAULT 'ACTIVE',
+                    created_at DATETIME2 DEFAULT GETDATE(), updated_at DATETIME2 DEFAULT GETDATE(),
                     CONSTRAINT PK_load_test PRIMARY KEY CLUSTERED (id)
                 )
             """)
@@ -884,148 +1427,141 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
 # Tibero JDBC 어댑터
 # ============================================================================
 class TiberoJDBCAdapter(DatabaseAdapter):
-    """Tibero JDBC 어댑터 (Oracle 호환)"""
-    
+    """Tibero JDBC 어댑터"""
+
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
         self.jar_file = find_jdbc_jar('tibero', jre_dir)
         if not self.jar_file:
-            raise RuntimeError("Tibero JDBC driver not found in ./jre directory")
-    
+            raise RuntimeError("Tibero JDBC driver not found")
+
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['tibero'].url_template.format(
-            host=config.host,
-            port=config.port or 8629,
-            sid=config.sid or config.database
+            host=config.host, port=config.port or 8629, sid=config.sid or config.database
         )
-        
         self.pool = JDBCConnectionPool(
-            jdbc_url=jdbc_url,
-            driver_class=JDBC_DRIVERS['tibero'].driver_class,
-            jar_file=self.jar_file,
-            user=config.user,
-            password=config.password,
-            min_size=config.min_pool_size,
-            max_size=config.max_pool_size
+            jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['tibero'].driver_class,
+            jar_file=self.jar_file, user=config.user, password=config.password,
+            min_size=config.min_pool_size, max_size=config.max_pool_size
         )
-        
         return self.pool
-    
+
     def get_connection(self):
         return self.pool.acquire()
-    
+
     def release_connection(self, connection, is_error: bool = False):
         if connection:
             try:
                 if is_error:
                     connection.rollback()
                 self.pool.release(connection)
-            except Exception as e:
-                logger.debug(f"Error releasing connection: {e}")
-    
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
-    
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
-        """Tibero INSERT with SEQUENCE"""
         cursor.execute("""
             INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
             VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
         """, [thread_id, f'TEST_{thread_id}', random_data])
-        
         cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
         result = cursor.fetchone()
         return int(result[0])
-    
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
+                VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+        return batch_size
+
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.fetchone()
-    
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute("UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = SYSTIMESTAMP WHERE ID = ?",
+                       [f'UPDATED_{record_id}', record_id])
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT NVL(MAX(ID), 0) FROM LOAD_TEST")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        return random.randint(1, max_id) if max_id > 0 else 0
+
     def commit(self, connection):
         connection.commit()
-    
+
     def rollback(self, connection):
         try:
             connection.rollback()
         except:
             pass
-    
+
     def get_ddl(self) -> str:
         return """
 -- Tibero DDL
 CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER;
 CREATE TABLE LOAD_TEST (
-    ID           NUMBER(19)      NOT NULL,
-    THREAD_ID    VARCHAR2(50)    NOT NULL,
-    VALUE_COL    VARCHAR2(200),
-    RANDOM_DATA  VARCHAR2(1000),
-    STATUS       VARCHAR2(20)    DEFAULT 'ACTIVE',
-    CREATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP,
-    UPDATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP
-)
-PARTITION BY HASH (ID)
-(
-    PARTITION P01, PARTITION P02, PARTITION P03, PARTITION P04,
-    PARTITION P05, PARTITION P06, PARTITION P07, PARTITION P08,
-    PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
-    PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
-)
-TABLESPACE USR_DATA
-ENABLE ROW MOVEMENT;
+    ID NUMBER(19) NOT NULL, THREAD_ID VARCHAR2(50) NOT NULL,
+    VALUE_COL VARCHAR2(200), RANDOM_DATA VARCHAR2(1000),
+    STATUS VARCHAR2(20) DEFAULT 'ACTIVE',
+    CREATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP, UPDATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP
+) PARTITION BY HASH (ID) PARTITIONS 16 ENABLE ROW MOVEMENT;
 ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
-CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
-CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL;
 """
 
     def setup_schema(self, connection):
-        """Tibero 스키마 설정"""
         cursor = connection.cursor()
         try:
-            # Drop Sequence
             try:
                 cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
-                logger.info("Dropped existing sequence LOAD_TEST_SEQ")
-            except Exception:
-                logger.info("Sequence LOAD_TEST_SEQ does not exist, skipping drop")
-
-            # Drop Table
+            except:
+                pass
             try:
                 cursor.execute("DROP TABLE LOAD_TEST PURGE")
-                logger.info("Dropped existing table LOAD_TEST")
-            except Exception:
-                logger.info("Table LOAD_TEST does not exist, skipping drop")
+            except:
+                pass
 
-            # Create Sequence
             cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
-            
-            # Create Table
             cursor.execute("""
                 CREATE TABLE LOAD_TEST (
-                    ID           NUMBER(19)      NOT NULL,
-                    THREAD_ID    VARCHAR2(50)    NOT NULL,
-                    VALUE_COL    VARCHAR2(200),
-                    RANDOM_DATA  VARCHAR2(1000),
-                    STATUS       VARCHAR2(20)    DEFAULT 'ACTIVE',
-                    CREATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP,
-                    UPDATED_AT   TIMESTAMP       DEFAULT SYSTIMESTAMP
-                )
-                PARTITION BY HASH (ID)
-                (
-                    PARTITION P01, PARTITION P02, PARTITION P03, PARTITION P04,
-                    PARTITION P05, PARTITION P06, PARTITION P07, PARTITION P08,
-                    PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
-                    PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
-                )
-                ENABLE ROW MOVEMENT
+                    ID NUMBER(19) NOT NULL, THREAD_ID VARCHAR2(50) NOT NULL,
+                    VALUE_COL VARCHAR2(200), RANDOM_DATA VARCHAR2(1000),
+                    STATUS VARCHAR2(20) DEFAULT 'ACTIVE',
+                    CREATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP,
+                    UPDATED_AT TIMESTAMP DEFAULT SYSTIMESTAMP
+                ) PARTITION BY HASH (ID) PARTITIONS 16 ENABLE ROW MOVEMENT
             """)
-            
             cursor.execute("ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)")
             cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL")
-            cursor.execute("CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL")
-            
             logger.info("Tibero schema created successfully")
-            
         except Exception as e:
             logger.error(f"Failed to setup Tibero schema: {e}")
             raise
@@ -1052,159 +1588,316 @@ class DatabaseConfig:
 
 
 # ============================================================================
-# 부하 테스트 워커
+# 부하 테스트 워커 - Enhanced
 # ============================================================================
 class LoadTestWorker:
-    """부하 테스트 워커 클래스"""
-    
-    def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime):
+    """부하 테스트 워커 - 전체 기능 지원"""
+
+    def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
+                 mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
+                 rate_limiter: RateLimiter = None, ramp_up_end_time: datetime = None):
         self.worker_id = worker_id
         self.db_adapter = db_adapter
         self.end_time = end_time
+        self.mode = mode
+        self.max_id_cache = max_id_cache
+        self.batch_size = batch_size
+        self.rate_limiter = rate_limiter
+        self.ramp_up_end_time = ramp_up_end_time
         self.thread_name = f"Worker-{worker_id:04d}"
         self.transaction_count = 0
-        
+
     def generate_random_data(self, length: int = 500) -> str:
-        """랜덤 데이터 생성"""
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-    
-    def execute_transaction(self, connection) -> bool:
-        """단일 트랜잭션 실행 (INSERT -> COMMIT -> SELECT -> VERIFY)"""
+
+    def is_during_ramp_up(self) -> bool:
+        """Ramp-up 기간인지 확인"""
+        if self.ramp_up_end_time is None:
+            return False
+        return datetime.now() < self.ramp_up_end_time
+
+    def execute_insert(self, connection) -> bool:
         cursor = None
+        start_time = time.time()
         try:
             cursor = connection.cursor()
-            
-            # 1. INSERT
             thread_id = self.thread_name
             random_data = self.generate_random_data()
-            
-            new_id = self.db_adapter.execute_insert(cursor, thread_id, random_data)
-            perf_counter.increment_insert()
-            
-            # 2. COMMIT
+
+            if self.batch_size > 1:
+                count = self.db_adapter.execute_batch_insert(cursor, thread_id, self.batch_size)
+                perf_counter.increment_insert(count)
+            else:
+                self.db_adapter.execute_insert(cursor, thread_id, random_data)
+                perf_counter.increment_insert()
+
             self.db_adapter.commit(connection)
-            
-            # 3. SELECT (검증)
-            result = self.db_adapter.execute_select(cursor, new_id)
-            perf_counter.increment_select()
-            
-            # 4. VERIFY
-            if result is None or result[0] != new_id:
-                logger.warning(f"[{self.thread_name}] Verification failed for ID={new_id}")
-                perf_counter.increment_verification_failure()
-                return False
-            
+
+            latency_ms = (time.time() - start_time) * 1000
+            perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
-            
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Transaction error: {str(e)}")
+            logger.error(f"[{self.thread_name}] Insert error: {str(e)}")
             perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
-            
         finally:
             if cursor:
                 try:
                     cursor.close()
                 except:
                     pass
-    
+
+    def execute_select(self, connection, max_id: int) -> bool:
+        cursor = None
+        start_time = time.time()
+        try:
+            cursor = connection.cursor()
+            self.db_adapter.execute_random_select(cursor, max_id)
+            perf_counter.increment_select()
+
+            latency_ms = (time.time() - start_time) * 1000
+            perf_counter.record_transaction(latency_ms)
+            self.transaction_count += 1
+            return True
+        except Exception as e:
+            logger.error(f"[{self.thread_name}] Select error: {str(e)}")
+            perf_counter.increment_error()
+            return False
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+
+    def execute_update(self, connection, max_id: int) -> bool:
+        cursor = None
+        start_time = time.time()
+        try:
+            cursor = connection.cursor()
+            record_id = self.db_adapter.get_random_id(cursor, max_id)
+            if record_id > 0:
+                self.db_adapter.execute_update(cursor, record_id)
+                self.db_adapter.commit(connection)
+            perf_counter.increment_update()
+
+            latency_ms = (time.time() - start_time) * 1000
+            perf_counter.record_transaction(latency_ms)
+            self.transaction_count += 1
+            return True
+        except Exception as e:
+            logger.error(f"[{self.thread_name}] Update error: {str(e)}")
+            perf_counter.increment_error()
+            self.db_adapter.rollback(connection)
+            return False
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+
+    def execute_delete(self, connection, max_id: int) -> bool:
+        cursor = None
+        start_time = time.time()
+        try:
+            cursor = connection.cursor()
+            record_id = self.db_adapter.get_random_id(cursor, max_id)
+            if record_id > 0:
+                self.db_adapter.execute_delete(cursor, record_id)
+                self.db_adapter.commit(connection)
+            perf_counter.increment_delete()
+
+            latency_ms = (time.time() - start_time) * 1000
+            perf_counter.record_transaction(latency_ms)
+            self.transaction_count += 1
+            return True
+        except Exception as e:
+            logger.error(f"[{self.thread_name}] Delete error: {str(e)}")
+            perf_counter.increment_error()
+            self.db_adapter.rollback(connection)
+            return False
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+
+    def execute_mixed(self, connection, max_id: int) -> bool:
+        """혼합 모드: INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%"""
+        rand = random.random()
+        if rand < 0.60:
+            return self.execute_insert(connection)
+        elif rand < 0.80:
+            return self.execute_select(connection, max_id)
+        elif rand < 0.95:
+            return self.execute_update(connection, max_id)
+        else:
+            return self.execute_delete(connection, max_id)
+
+    def execute_full(self, connection) -> bool:
+        """전체 트랜잭션: INSERT -> COMMIT -> SELECT -> VERIFY"""
+        cursor = None
+        start_time = time.time()
+        try:
+            cursor = connection.cursor()
+            thread_id = self.thread_name
+            random_data = self.generate_random_data()
+
+            new_id = self.db_adapter.execute_insert(cursor, thread_id, random_data)
+            perf_counter.increment_insert()
+            self.db_adapter.commit(connection)
+
+            result = self.db_adapter.execute_select(cursor, new_id)
+            perf_counter.increment_select()
+
+            if result is None or result[0] != new_id:
+                perf_counter.increment_verification_failure()
+                return False
+
+            latency_ms = (time.time() - start_time) * 1000
+            perf_counter.record_transaction(latency_ms)
+            self.transaction_count += 1
+            return True
+        except Exception as e:
+            logger.error(f"[{self.thread_name}] Transaction error: {str(e)}")
+            perf_counter.increment_error()
+            self.db_adapter.rollback(connection)
+            return False
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+
     def run(self) -> int:
-        """워커 실행 (종료 시간까지 반복)"""
-        logger.info(f"[{self.thread_name}] Starting worker")
-        
+        """워커 실행"""
+        logger.info(f"[{self.thread_name}] Starting (mode: {self.mode})")
+
         connection = None
         consecutive_errors = 0
-        
+        max_id = self.max_id_cache
+
         while datetime.now() < self.end_time:
+            # Graceful shutdown 체크
+            if shutdown_handler and shutdown_handler.is_shutdown_requested():
+                break
+
+            # Rate limiting
+            if self.rate_limiter and not self.rate_limiter.acquire(timeout=0.5):
+                continue
+
             try:
-                # 커넥션이 없으면 새로 획득
                 if connection is None:
                     connection = self.db_adapter.get_connection()
                     consecutive_errors = 0
-                
-                # 트랜잭션 실행
-                success = self.execute_transaction(connection)
-                
+
+                    if self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
+                                     WorkMode.DELETE_ONLY, WorkMode.MIXED] and max_id == 0:
+                        cursor = connection.cursor()
+                        max_id = self.db_adapter.get_max_id(cursor)
+                        cursor.close()
+                        if max_id == 0:
+                            time.sleep(1)
+                            continue
+
+                # 모드별 실행
+                if self.mode == WorkMode.INSERT_ONLY:
+                    success = self.execute_insert(connection)
+                elif self.mode == WorkMode.SELECT_ONLY:
+                    success = self.execute_select(connection, max_id)
+                elif self.mode == WorkMode.UPDATE_ONLY:
+                    success = self.execute_update(connection, max_id)
+                elif self.mode == WorkMode.DELETE_ONLY:
+                    success = self.execute_delete(connection, max_id)
+                elif self.mode == WorkMode.MIXED:
+                    success = self.execute_mixed(connection, max_id)
+                else:
+                    success = self.execute_full(connection)
+
                 if not success:
                     consecutive_errors += 1
                     if consecutive_errors >= 5:
-                        # 연속 에러 발생 시 커넥션 교체
-                        logger.warning(f"[{self.thread_name}] Too many errors, recreating connection")
-                        self.db_adapter.release_connection(connection, is_error=True)
+                        self.db_adapter.discard_connection(connection)
                         connection = None
                         perf_counter.increment_connection_recreate()
                         time.sleep(0.5)
                 else:
                     consecutive_errors = 0
-                
+
             except Exception as e:
-                logger.error(f"[{self.thread_name}] Connection error: {str(e)}")
+                logger.error(f"[{self.thread_name}] Error: {str(e)}")
                 perf_counter.increment_error()
-                
-                # 커넥션 정리
                 if connection:
-                    self.db_adapter.release_connection(connection, is_error=True)
+                    self.db_adapter.discard_connection(connection)
                     connection = None
                     perf_counter.increment_connection_recreate()
-                
                 time.sleep(0.5)
-        
-        # 정리
+
         if connection:
             self.db_adapter.release_connection(connection)
-        
-        logger.info(f"[{self.thread_name}] Worker completed. Total transactions: {self.transaction_count}")
+
+        logger.info(f"[{self.thread_name}] Completed. Transactions: {self.transaction_count}")
         return self.transaction_count
 
 
 # ============================================================================
-# 모니터링 스레드
+# 모니터링 스레드 - Enhanced
 # ============================================================================
 class MonitorThread(threading.Thread):
-    """모니터링 스레드 - 주기적으로 통계 출력"""
-    
-    def __init__(self, interval_seconds: int, end_time: datetime):
+    """모니터링 스레드"""
+
+    def __init__(self, interval_seconds: float, end_time: datetime,
+                 sub_second_interval_ms: int, db_adapter: DatabaseAdapter):
         super().__init__(name="Monitor", daemon=True)
         self.interval_seconds = interval_seconds
         self.end_time = end_time
+        self.sub_second_interval_ms = sub_second_interval_ms
+        self.db_adapter = db_adapter
         self.running = True
-        self.last_inserts = 0
-        self.last_time = time.time()
-        
+
     def run(self):
-        """모니터링 실행"""
-        logger.info("[Monitor] Starting performance monitor")
-        
+        logger.info(f"[Monitor] Starting (interval: {self.interval_seconds}s)")
+
         while self.running and datetime.now() < self.end_time:
+            if shutdown_handler and shutdown_handler.is_shutdown_requested():
+                break
+
             time.sleep(self.interval_seconds)
-            
+
             stats = perf_counter.get_stats()
-            current_time = time.time()
-            
-            # 구간 TPS 계산
-            interval_inserts = stats['total_inserts'] - self.last_inserts
-            interval_time = current_time - self.last_time
-            interval_tps = interval_inserts / interval_time if interval_time > 0 else 0
-            
+            interval_stats = perf_counter.get_interval_stats()
+            latency_stats = perf_counter.get_latency_stats()
+            pool_stats = self.db_adapter.get_pool_stats()
+
+            realtime_tps = perf_counter.get_sub_second_tps()
+            windowed_tps = perf_counter.get_windowed_tps(self.sub_second_interval_ms)
+
+            warmup_indicator = "[WARMUP] " if perf_counter.is_warmup_period() else ""
+
             logger.info(
-                f"[Monitor] Stats - "
-                f"Inserts: {stats['total_inserts']:,} | "
-                f"Selects: {stats['total_selects']:,} | "
-                f"Errors: {stats['total_errors']:,} | "
-                f"Ver.Fail: {stats['verification_failures']:,} | "
-                f"Conn.Recreate: {stats['connection_recreates']:,} | "
-                f"Avg TPS: {stats['tps']:.2f} | "
-                f"Interval TPS: {interval_tps:.2f} | "
-                f"Elapsed: {stats['elapsed_seconds']:.1f}s"
+                f"[Monitor] {warmup_indicator}"
+                f"TXN: {stats['total_transactions']:,} | "
+                f"INS: {stats['total_inserts']:,} | "
+                f"SEL: {stats['total_selects']:,} | "
+                f"UPD: {stats['total_updates']:,} | "
+                f"DEL: {stats['total_deletes']:,} | "
+                f"ERR: {stats['total_errors']:,} | "
+                f"Avg TPS: {stats['avg_tps']:.1f} | "
+                f"RT TPS: {realtime_tps:.1f} | "
+                f"Lat(p95/p99): {latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
+                f"Pool: {pool_stats.get('pool_active', 0)}/{pool_stats.get('pool_total', 0)}"
             )
-            
-            self.last_inserts = stats['total_inserts']
-            self.last_time = current_time
-        
-        logger.info("[Monitor] Stopping performance monitor")
-    
+
+            # 시계열 데이터 기록
+            perf_counter.record_time_series(pool_stats)
+
+        logger.info("[Monitor] Stopped")
+
     def stop(self):
         self.running = False
 
@@ -1214,190 +1907,294 @@ class MonitorThread(threading.Thread):
 # ============================================================================
 class MultiDBLoadTester:
     """멀티 데이터베이스 부하 테스터"""
-    
+
     def __init__(self, config: DatabaseConfig):
         self.config = config
         self.db_adapter = self._create_adapter()
-        
+
     def _create_adapter(self) -> DatabaseAdapter:
-        """DB 타입에 따른 어댑터 생성"""
         db_type = self.config.db_type.lower()
-        
-        if db_type == 'oracle':
-            return OracleJDBCAdapter(self.config.jre_dir)
-        elif db_type in ['postgresql', 'postgres', 'pg']:
-            return PostgreSQLJDBCAdapter(self.config.jre_dir)
-        elif db_type == 'mysql':
-            return MySQLJDBCAdapter(self.config.jre_dir)
-        elif db_type in ['sqlserver', 'mssql', 'sql_server']:
-            return SQLServerJDBCAdapter(self.config.jre_dir)
-        elif db_type == 'tibero':
-            return TiberoJDBCAdapter(self.config.jre_dir)
-        else:
+
+        adapters = {
+            'oracle': OracleJDBCAdapter,
+            'postgresql': PostgreSQLJDBCAdapter, 'postgres': PostgreSQLJDBCAdapter, 'pg': PostgreSQLJDBCAdapter,
+            'mysql': MySQLJDBCAdapter,
+            'sqlserver': SQLServerJDBCAdapter, 'mssql': SQLServerJDBCAdapter,
+            'tibero': TiberoJDBCAdapter
+        }
+
+        if db_type not in adapters:
             raise ValueError(f"Unsupported database type: {self.config.db_type}")
-    
+
+        return adapters[db_type](self.config.jre_dir)
+
     def print_ddl(self):
-        """DDL 출력"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print(f"DDL for {self.config.db_type.upper()} (JDBC)")
-        print("="*80)
+        print("=" * 80)
         print(self.db_adapter.get_ddl())
-        print("="*80 + "\n")
-    
-    def run_load_test(self, thread_count: int, duration_seconds: int):
+        print("=" * 80 + "\n")
+
+    def run_load_test(self, thread_count: int, duration_seconds: int,
+                      mode: str = WorkMode.FULL, skip_schema_setup: bool = False,
+                      monitor_interval: float = 5.0, sub_second_interval_ms: int = 100,
+                      warmup_seconds: int = 0, ramp_up_seconds: int = 0,
+                      target_tps: int = 0, batch_size: int = 1,
+                      output_format: str = None, output_file: str = None):
         """부하 테스트 실행"""
-        logger.info(f"Starting load test: {thread_count} threads for {duration_seconds} seconds")
-        
+        global perf_counter, shutdown_handler
+
+        logger.info(f"Starting load test: {thread_count} threads for {duration_seconds}s (mode: {mode})")
+
+        # Graceful shutdown 핸들러
+        shutdown_handler = GracefulShutdown()
+
+        # 성능 카운터 초기화
+        perf_counter = PerformanceCounter(sub_second_window_ms=sub_second_interval_ms)
+
         # 커넥션 풀 생성
         self.db_adapter.create_connection_pool(self.config)
-        
-        # 스키마 설정 (Drop & Create)
-        logger.info("Setting up database schema...")
-        conn = self.db_adapter.get_connection()
-        try:
-            self.db_adapter.setup_schema(conn)
-            self.db_adapter.commit(conn)
-        except Exception as e:
-            logger.error(f"Schema setup failed: {e}")
-            self.db_adapter.release_connection(conn)
-            sys.exit(1)
-        finally:
-            self.db_adapter.release_connection(conn)
 
-        
-        # 종료 시간 설정
-        end_time = datetime.now() + timedelta(seconds=duration_seconds)
-        
-        # 모니터링 스레드 시작
-        monitor = MonitorThread(interval_seconds=5, end_time=end_time)
+        # 스키마 설정
+        if not skip_schema_setup:
+            logger.info("Setting up database schema...")
+            conn = self.db_adapter.get_connection()
+            try:
+                self.db_adapter.setup_schema(conn)
+                self.db_adapter.commit(conn)
+            except Exception as e:
+                logger.error(f"Schema setup failed: {e}")
+                self.db_adapter.release_connection(conn)
+                sys.exit(1)
+            finally:
+                self.db_adapter.release_connection(conn)
+
+        # 기존 데이터 확인
+        max_id_cache = 0
+        if mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY, WorkMode.DELETE_ONLY, WorkMode.MIXED]:
+            conn = self.db_adapter.get_connection()
+            cursor = conn.cursor()
+            max_id_cache = self.db_adapter.get_max_id(cursor)
+            cursor.close()
+            self.db_adapter.release_connection(conn)
+            logger.info(f"Found {max_id_cache} existing records")
+
+        # 시간 설정
+        now = datetime.now()
+        warmup_end_time = now + timedelta(seconds=warmup_seconds) if warmup_seconds > 0 else now
+        ramp_up_end_time = warmup_end_time + timedelta(seconds=ramp_up_seconds) if ramp_up_seconds > 0 else None
+        end_time = now + timedelta(seconds=duration_seconds + warmup_seconds)
+
+        # 워밍업 설정
+        if warmup_seconds > 0:
+            perf_counter.set_warmup_end_time(warmup_end_time.timestamp())
+            logger.info(f"Warmup period: {warmup_seconds} seconds")
+
+        # Rate limiter
+        rate_limiter = RateLimiter(target_tps) if target_tps > 0 else None
+        if target_tps > 0:
+            logger.info(f"Target TPS: {target_tps}")
+
+        # 모니터링 스레드
+        monitor = MonitorThread(
+            interval_seconds=monitor_interval,
+            end_time=end_time,
+            sub_second_interval_ms=sub_second_interval_ms,
+            db_adapter=self.db_adapter
+        )
         monitor.start()
-        
-        # 워커 스레드 실행
+
+        # Ramp-up 지원 워커 실행
         total_transactions = 0
+        ramp_up_delay = ramp_up_seconds / thread_count if ramp_up_seconds > 0 else 0
+
         with ThreadPoolExecutor(max_workers=thread_count, thread_name_prefix="Worker") as executor:
             futures = []
             for i in range(thread_count):
-                worker = LoadTestWorker(i + 1, self.db_adapter, end_time)
+                # Ramp-up 딜레이
+                if ramp_up_delay > 0 and i > 0:
+                    time.sleep(ramp_up_delay)
+                    if shutdown_handler.is_shutdown_requested():
+                        break
+
+                worker = LoadTestWorker(
+                    worker_id=i + 1,
+                    db_adapter=self.db_adapter,
+                    end_time=end_time,
+                    mode=mode,
+                    max_id_cache=max_id_cache,
+                    batch_size=batch_size,
+                    rate_limiter=rate_limiter,
+                    ramp_up_end_time=ramp_up_end_time
+                )
                 future = executor.submit(worker.run)
                 futures.append(future)
-            
-            # 모든 워커 완료 대기
+
             for future in as_completed(futures):
                 try:
                     result = future.result()
                     total_transactions += result
                 except Exception as e:
-                    logger.error(f"Worker thread failed: {str(e)}")
-        
-        # 모니터링 스레드 정지
+                    logger.error(f"Worker failed: {str(e)}")
+
         monitor.stop()
         monitor.join(timeout=5)
-        
+
         # 최종 통계 출력
-        self._print_final_stats(thread_count, duration_seconds, total_transactions)
-        
-        # 풀 정리
+        self._print_final_stats(thread_count, duration_seconds, total_transactions, mode,
+                                warmup_seconds, target_tps, batch_size)
+
+        # 결과 내보내기
+        if output_format and output_file:
+            self._export_results(output_format, output_file, thread_count, duration_seconds, mode)
+
         self.db_adapter.close_pool()
-    
-    def _print_final_stats(self, thread_count: int, duration_seconds: int, total_transactions: int):
+
+    def _print_final_stats(self, thread_count: int, duration_seconds: int,
+                           total_transactions: int, mode: str,
+                           warmup_seconds: int, target_tps: int, batch_size: int):
         """최종 통계 출력"""
         final_stats = perf_counter.get_stats()
-        
-        logger.info("="*80)
+        latency_stats = perf_counter.get_latency_stats()
+
+        logger.info("=" * 80)
         logger.info("LOAD TEST COMPLETED - FINAL STATISTICS")
-        logger.info("="*80)
+        logger.info("=" * 80)
         logger.info(f"Database Type: {self.config.db_type.upper()} (JDBC)")
+        logger.info(f"Work Mode: {mode}")
         logger.info(f"Total Threads: {thread_count}")
-        logger.info(f"Test Duration: {duration_seconds} seconds")
-        logger.info(f"Actual Elapsed: {final_stats['elapsed_seconds']:.1f} seconds")
-        logger.info("-"*80)
-        logger.info(f"Total Inserts: {final_stats['total_inserts']:,}")
-        logger.info(f"Total Selects: {final_stats['total_selects']:,}")
+        logger.info(f"Test Duration: {duration_seconds}s (Warmup: {warmup_seconds}s)")
+        if target_tps > 0:
+            logger.info(f"Target TPS: {target_tps}")
+        if batch_size > 1:
+            logger.info(f"Batch Size: {batch_size}")
+        logger.info("-" * 80)
+        logger.info(f"Total Transactions: {final_stats['total_transactions']:,}")
+        logger.info(f"  - Inserts: {final_stats['total_inserts']:,}")
+        logger.info(f"  - Selects: {final_stats['total_selects']:,}")
+        logger.info(f"  - Updates: {final_stats['total_updates']:,}")
+        logger.info(f"  - Deletes: {final_stats['total_deletes']:,}")
         logger.info(f"Total Errors: {final_stats['total_errors']:,}")
         logger.info(f"Verification Failures: {final_stats['verification_failures']:,}")
-        logger.info(f"Connection Recreates: {final_stats['connection_recreates']:,}")
-        logger.info("-"*80)
-        logger.info(f"Average TPS: {final_stats['tps']:.2f}")
-        logger.info(f"Transactions per Thread: {total_transactions / thread_count:.2f}")
-        logger.info(f"Success Rate: {((final_stats['total_inserts'] - final_stats['total_errors']) / final_stats['total_inserts'] * 100):.2f}%" if final_stats['total_inserts'] > 0 else "N/A")
-        logger.info("="*80)
+        logger.info("-" * 80)
+        logger.info(f"Average TPS (overall): {final_stats['avg_tps']:.2f}")
+        if warmup_seconds > 0:
+            logger.info(f"Average TPS (post-warmup): {final_stats['post_warmup_tps']:.2f}")
+        logger.info(f"Realtime TPS (last 1s): {final_stats['realtime_tps']:.2f}")
+
+        if final_stats['total_transactions'] > 0:
+            success_rate = (1 - final_stats['total_errors'] / final_stats['total_transactions']) * 100
+            logger.info(f"Success Rate: {success_rate:.2f}%")
+
+        logger.info("-" * 80)
+        logger.info(f"Latency (ms) - Avg: {latency_stats['avg']:.2f}, P50: {latency_stats['p50']:.2f}, "
+                    f"P95: {latency_stats['p95']:.2f}, P99: {latency_stats['p99']:.2f}, "
+                    f"Min: {latency_stats['min']:.2f}, Max: {latency_stats['max']:.2f}")
+        logger.info("=" * 80)
+
+    def _export_results(self, output_format: str, output_file: str,
+                        thread_count: int, duration_seconds: int, mode: str):
+        """결과 내보내기"""
+        stats = perf_counter.get_stats()
+        latency_stats = perf_counter.get_latency_stats()
+        time_series = perf_counter.time_series
+
+        config_dict = {
+            'db_type': self.config.db_type,
+            'host': self.config.host,
+            'thread_count': thread_count,
+            'duration_seconds': duration_seconds,
+            'mode': mode
+        }
+
+        if output_format.lower() == 'csv':
+            ResultExporter.export_csv(output_file, stats, time_series, config_dict)
+        elif output_format.lower() == 'json':
+            ResultExporter.export_json(output_file, stats, time_series, config_dict, latency_stats)
 
 
 # ============================================================================
 # 명령행 인자 파싱
 # ============================================================================
 def parse_arguments():
-    """명령행 인자 파싱"""
     parser = argparse.ArgumentParser(
-        description='Multi-Database Load Tester using JDBC drivers from ./jre directory',
+        description='Multi-Database Load Tester v2.0 (JDBC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Work Modes:
+  full        : INSERT -> COMMIT -> SELECT (default)
+  insert-only : INSERT -> COMMIT only
+  select-only : SELECT only (requires existing data)
+  update-only : UPDATE only (requires existing data)
+  delete-only : DELETE only (requires existing data)
+  mixed       : INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%
+
 Examples:
-  # Oracle
+  # Basic usage
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
-      --user test_user --password pass --thread-count 200
+      --user test --password pass --thread-count 200
 
-  # PostgreSQL
-  python multi_db_load_tester_jdbc.py --db-type postgresql \\
-      --host localhost --port 5432 --database testdb \\
-      --user test_user --password pass --thread-count 200
+  # With warmup and ramp-up
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --warmup 30 --ramp-up 60
 
-  # MySQL
-  python multi_db_load_tester_jdbc.py --db-type mysql \\
-      --host localhost --database testdb \\
-      --user test_user --password pass --thread-count 100
+  # Batch INSERT with rate limiting
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --mode insert-only --batch-size 100 --target-tps 5000
 
-  # SQL Server
-  python multi_db_load_tester_jdbc.py --db-type sqlserver \\
-      --host localhost --database testdb \\
-      --user sa --password pass --thread-count 200
-
-  # Tibero
-  python multi_db_load_tester_jdbc.py --db-type tibero \\
-      --host localhost --port 8629 --sid tibero \\
-      --user test_user --password pass --thread-count 200
-
-JDBC Drivers Required in ./jre directory:
-  - Oracle: ojdbc*.jar
-  - Tibero: tibero*jdbc*.jar
-  - PostgreSQL: postgresql-*.jar
-  - MySQL: mysql-connector-*.jar
-  - SQL Server: mssql-jdbc-*.jar
+  # Export results
+  python multi_db_load_tester_jdbc.py --db-type oracle \\
+      --host localhost --port 1521 --sid XEPDB1 \\
+      --user test --password pass --output-format json --output-file results.json
         """
     )
-    
-    # 데이터베이스 타입
-    parser.add_argument(
-        '--db-type',
-        required=True,
-        choices=['oracle', 'postgresql', 'postgres', 'pg', 'mysql', 'sqlserver', 'mssql', 'tibero'],
-        help='Database type'
-    )
-    
-    # 연결 정보
-    parser.add_argument('--host', required=True, help='Database host')
-    parser.add_argument('--port', type=int, help='Database port')
-    parser.add_argument('--database', help='Database name (PostgreSQL, MySQL, SQL Server)')
-    parser.add_argument('--sid', help='SID or Service Name (Oracle, Tibero)')
-    parser.add_argument('--user', required=True, help='Database username')
-    parser.add_argument('--password', required=True, help='Database password')
-    
-    # JRE 디렉터리
-    parser.add_argument('--jre-dir', default='./jre', help='JRE/JDBC drivers directory')
-    
+
+    # 필수 옵션
+    parser.add_argument('--db-type', required=True,
+                        choices=['oracle', 'postgresql', 'postgres', 'pg', 'mysql', 'sqlserver', 'mssql', 'tibero'])
+    parser.add_argument('--host', required=True)
+    parser.add_argument('--user', required=True)
+    parser.add_argument('--password', required=True)
+
+    # 연결 옵션
+    parser.add_argument('--port', type=int)
+    parser.add_argument('--database')
+    parser.add_argument('--sid')
+    parser.add_argument('--jre-dir', default='./jre')
+
     # 풀 설정
-    parser.add_argument('--min-pool-size', type=int, default=100, help='Minimum pool size')
-    parser.add_argument('--max-pool-size', type=int, default=200, help='Maximum pool size')
-    
+    parser.add_argument('--min-pool-size', type=int, default=100)
+    parser.add_argument('--max-pool-size', type=int, default=200)
+
     # 테스트 설정
-    parser.add_argument('--thread-count', type=int, default=100, help='Number of worker threads')
-    parser.add_argument('--test-duration', type=int, default=300, help='Test duration (seconds)')
-    
+    parser.add_argument('--thread-count', type=int, default=100)
+    parser.add_argument('--test-duration', type=int, default=300)
+    parser.add_argument('--mode', choices=[WorkMode.FULL, WorkMode.INSERT_ONLY, WorkMode.SELECT_ONLY,
+                                           WorkMode.UPDATE_ONLY, WorkMode.DELETE_ONLY, WorkMode.MIXED],
+                        default=WorkMode.FULL)
+    parser.add_argument('--skip-schema-setup', action='store_true')
+
+    # 고급 설정
+    parser.add_argument('--warmup', type=int, default=0, help='Warmup period in seconds')
+    parser.add_argument('--ramp-up', type=int, default=0, help='Ramp-up period in seconds')
+    parser.add_argument('--target-tps', type=int, default=0, help='Target TPS (0 = unlimited)')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch INSERT size')
+
+    # 모니터링
+    parser.add_argument('--monitor-interval', type=float, default=5.0)
+    parser.add_argument('--sub-second-interval', type=int, default=100)
+
+    # 결과 내보내기
+    parser.add_argument('--output-format', choices=['csv', 'json'])
+    parser.add_argument('--output-file')
+
     # 기타
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
-    parser.add_argument('--print-ddl', action='store_true', help='Print DDL and exit')
-    
+    parser.add_argument('--print-ddl', action='store_true')
+
     return parser.parse_args()
 
 
@@ -1405,81 +2202,71 @@ JDBC Drivers Required in ./jre directory:
 # 메인 함수
 # ============================================================================
 def main():
-    """메인 함수"""
     args = parse_arguments()
-    
-    # jaydebeapi 확인
+
     if not JAYDEBEAPI_AVAILABLE:
-        logger.error("jaydebeapi is not installed. Install with: pip install jaydebeapi")
-        logger.error("Also ensure JPype1 is installed: pip install JPype1")
+        logger.error("jaydebeapi/JPype1 not installed")
         sys.exit(1)
-    
-    # 로깅 레벨 설정
+
     logger.setLevel(getattr(logging, args.log_level))
-    
-    # 데이터베이스 설정 생성
+
     config = DatabaseConfig(
-        db_type=args.db_type,
-        host=args.host,
-        port=args.port,
-        database=args.database,
-        sid=args.sid,
-        user=args.user,
-        password=args.password,
-        min_pool_size=args.min_pool_size,
-        max_pool_size=args.max_pool_size,
+        db_type=args.db_type, host=args.host, port=args.port,
+        database=args.database, sid=args.sid,
+        user=args.user, password=args.password,
+        min_pool_size=args.min_pool_size, max_pool_size=args.max_pool_size,
         jre_dir=args.jre_dir
     )
-    
-    # JVM 초기화
+
     initialize_jvm(args.jre_dir)
-    
-    # JRE 디렉터리 확인
+
     if not os.path.exists(args.jre_dir):
         logger.error(f"JRE directory not found: {args.jre_dir}")
         sys.exit(1)
-    
-    # 테스터 생성
+
     try:
         tester = MultiDBLoadTester(config)
     except Exception as e:
         logger.error(f"Failed to create tester: {str(e)}")
         sys.exit(1)
-    
-    # DDL 출력 모드
+
     if args.print_ddl:
         tester.print_ddl()
         return
-    
+
     # 설정 출력
-    logger.info("="*80)
-    logger.info("MULTI-DATABASE LOAD TESTER CONFIGURATION (JDBC)")
-    logger.info("="*80)
-    logger.info(f"Database Type: {config.db_type.upper()}")
-    logger.info(f"Host: {config.host}")
-    if config.port:
-        logger.info(f"Port: {config.port}")
-    if config.database:
-        logger.info(f"Database: {config.database}")
-    if config.sid:
-        logger.info(f"SID: {config.sid}")
-    logger.info(f"User: {config.user}")
-    logger.info(f"JRE Directory: {config.jre_dir}")
-    logger.info(f"Min Pool Size: {config.min_pool_size}")
-    logger.info(f"Max Pool Size: {config.max_pool_size}")
-    logger.info(f"Thread Count: {args.thread_count}")
-    logger.info(f"Test Duration: {args.test_duration} seconds")
-    logger.info("="*80)
-    
-    # 부하 테스트 실행
+    logger.info("=" * 80)
+    logger.info("MULTI-DATABASE LOAD TESTER v2.0 (JDBC)")
+    logger.info("=" * 80)
+    logger.info(f"Database: {config.db_type.upper()} @ {config.host}")
+    logger.info(f"Threads: {args.thread_count} | Duration: {args.test_duration}s | Mode: {args.mode}")
+    if args.warmup > 0:
+        logger.info(f"Warmup: {args.warmup}s")
+    if args.ramp_up > 0:
+        logger.info(f"Ramp-up: {args.ramp_up}s")
+    if args.target_tps > 0:
+        logger.info(f"Target TPS: {args.target_tps}")
+    if args.batch_size > 1:
+        logger.info(f"Batch Size: {args.batch_size}")
+    logger.info("=" * 80)
+
     try:
         tester.run_load_test(
             thread_count=args.thread_count,
-            duration_seconds=args.test_duration
+            duration_seconds=args.test_duration,
+            mode=args.mode,
+            skip_schema_setup=args.skip_schema_setup,
+            monitor_interval=args.monitor_interval,
+            sub_second_interval_ms=args.sub_second_interval,
+            warmup_seconds=args.warmup,
+            ramp_up_seconds=args.ramp_up,
+            target_tps=args.target_tps,
+            batch_size=args.batch_size,
+            output_format=args.output_format,
+            output_file=args.output_file
         )
     except KeyboardInterrupt:
         logger.info("Test interrupted by user")
-        sys.exit(1)
     except Exception as e:
         logger.error(f"Test failed: {str(e)}", exc_info=True)
         sys.exit(1)
