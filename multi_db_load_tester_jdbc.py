@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.0
+멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.2
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 
 특징:
@@ -63,6 +63,9 @@ from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import queue
 
+# Keep version in one place for logging/CLI banners.
+VERSION = "2.2"
+
 # JDBC 드라이버 사용을 위한 라이브러리
 try:
     import jaydebeapi
@@ -74,13 +77,32 @@ except ImportError:
     sys.exit(1)
 
 # 로깅 설정
+log_format = '%(asctime)s - %(message)s'
+log_formatter = logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S')
+
+console_format = '%(asctime)s - %(message)s'
+console_formatter = logging.Formatter(console_format, datefmt='%H:%M:%S')
+
+
+class BelowWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
+
+file_handler = logging.FileHandler('multi_db_load_test_jdbc.log')
+file_handler.setFormatter(log_formatter)
+file_handler.addFilter(BelowWarningFilter())
+
+error_handler = logging.FileHandler('multi_db_load_test_jdbc_error.log')
+error_handler.setLevel(logging.WARNING)
+error_handler.setFormatter(log_formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(console_formatter)
+console_handler.addFilter(BelowWarningFilter())
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [%(threadName)-15s] - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('multi_db_load_test_jdbc.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[file_handler, error_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -167,6 +189,11 @@ class PerformanceCounter:
         # 구간별 통계
         self.last_check_time = time.time()
         self.last_transactions = 0
+        self.last_inserts = 0
+        self.last_selects = 0
+        self.last_updates = 0
+        self.last_deletes = 0
+        self.last_errors = 0
 
         # 시계열 데이터 (결과 내보내기용)
         self.time_series: List[Dict[str, Any]] = []
@@ -181,6 +208,10 @@ class PerformanceCounter:
         if self.warmup_end_time is None:
             return False
         return time.time() < self.warmup_end_time
+
+    def has_warmup_config(self) -> bool:
+        """워밍업 설정 여부 확인"""
+        return self.warmup_end_time is not None
 
     def record_transaction(self, latency_ms: float = 0):
         """트랜잭션 완료 기록"""
@@ -284,15 +315,30 @@ class PerformanceCounter:
         with self.lock:
             interval_time = current_time - self.last_check_time
             interval_transactions = self.total_transactions - self.last_transactions
+            interval_inserts = self.total_inserts - self.last_inserts
+            interval_selects = self.total_selects - self.last_selects
+            interval_updates = self.total_updates - self.last_updates
+            interval_deletes = self.total_deletes - self.last_deletes
+            interval_errors = self.total_errors - self.last_errors
 
             self.last_check_time = current_time
             self.last_transactions = self.total_transactions
+            self.last_inserts = self.total_inserts
+            self.last_selects = self.total_selects
+            self.last_updates = self.total_updates
+            self.last_deletes = self.total_deletes
+            self.last_errors = self.total_errors
 
             interval_tps = interval_transactions / interval_time if interval_time > 0 else 0
 
             return {
                 'interval_seconds': interval_time,
                 'interval_transactions': interval_transactions,
+                'interval_inserts': interval_inserts,
+                'interval_selects': interval_selects,
+                'interval_updates': interval_updates,
+                'interval_deletes': interval_deletes,
+                'interval_errors': interval_errors,
                 'interval_tps': round(interval_tps, 2)
             }
 
@@ -446,7 +492,7 @@ class ResultExporter:
         result = {
             'test_info': {
                 'timestamp': datetime.now().isoformat(),
-                'version': '2.0'
+                'version': '2.2'
             },
             'configuration': config,
             'final_statistics': stats,
@@ -496,6 +542,11 @@ JDBC_DRIVERS = {
         driver_class='com.microsoft.sqlserver.jdbc.SQLServerDriver',
         jar_pattern='mssql-jdbc-*.jar',
         url_template='jdbc:sqlserver://{host}:{port};databaseName={database}'
+    ),
+    'db2': JDBCDriverInfo(
+        driver_class='com.ibm.db2.jcc.DB2Driver',
+        jar_pattern='jcc*.jar',
+        url_template='jdbc:db2://{host}:{port}/{database}'
     )
 }
 
@@ -604,16 +655,19 @@ class PooledConnection:
     created_at: float = field(default_factory=time.time)
     acquired_at: Optional[float] = None
     acquired_by: Optional[str] = None
+    last_used_at: float = field(default_factory=time.time)
 
     def mark_acquired(self, thread_name: str = None):
         """커넥션 획득 시 호출"""
         self.acquired_at = time.time()
         self.acquired_by = thread_name or threading.current_thread().name
+        self.last_used_at = self.acquired_at
 
     def mark_released(self):
         """커넥션 반환 시 호출"""
         self.acquired_at = None
         self.acquired_by = None
+        self.last_used_at = time.time()
 
     def get_age_seconds(self) -> float:
         """커넥션 생성 후 경과 시간 (초)"""
@@ -624,6 +678,12 @@ class PooledConnection:
         if self.acquired_at is None:
             return None
         return time.time() - self.acquired_at
+
+    def get_idle_seconds(self) -> Optional[float]:
+        """커넥션 유휴 시간 (초)"""
+        if self.acquired_at is not None:
+            return None
+        return time.time() - self.last_used_at
 
 
 class JDBCConnectionPool:
@@ -641,7 +701,9 @@ class JDBCConnectionPool:
                  validation_timeout: int = 5,
                  max_lifetime_seconds: int = 1800,
                  leak_detection_threshold_seconds: int = 60,
-                 idle_check_interval_seconds: int = 30):
+                 idle_check_interval_seconds: int = 30,
+                 idle_timeout_seconds: int = 30,
+                 keepalive_time_seconds: int = 30):
         """
         Args:
             jdbc_url: JDBC 연결 URL
@@ -667,6 +729,12 @@ class JDBCConnectionPool:
         self.max_lifetime_seconds = max_lifetime_seconds
         self.leak_detection_threshold_seconds = leak_detection_threshold_seconds
         self.idle_check_interval_seconds = idle_check_interval_seconds
+        self.idle_timeout_seconds = idle_timeout_seconds
+        if keepalive_time_seconds > 0 and keepalive_time_seconds < 30:
+            logger.warning("Keepalive time < 30s; disabling keepalive checks")
+            self.keepalive_time_seconds = 0
+        else:
+            self.keepalive_time_seconds = keepalive_time_seconds
 
         self.pool = queue.Queue(maxsize=max_size)
         self.current_size = 0
@@ -690,6 +758,8 @@ class JDBCConnectionPool:
         logger.info(f"  - Max Lifetime: {max_lifetime_seconds}s")
         logger.info(f"  - Leak Detection Threshold: {leak_detection_threshold_seconds}s")
         logger.info(f"  - Idle Check Interval: {idle_check_interval_seconds}s")
+        logger.info(f"  - Idle Timeout: {self.idle_timeout_seconds}s")
+        logger.info(f"  - Keepalive Time: {self.keepalive_time_seconds}s")
         logger.info(f"JDBC URL: {jdbc_url}")
 
         # Pool Warm-up: min_size만큼 커넥션 미리 생성
@@ -794,12 +864,11 @@ class JDBCConnectionPool:
                 logger.error(f"[Health Check] Error: {e}")
 
     def _check_idle_connections(self):
-        """유휴 커넥션 검증 및 만료된 커넥션 제거"""
+        """Idle connection health check and cleanup."""
         checked = 0
         removed = 0
         recycled = 0
 
-        # 임시 리스트에 유효한 커넥션 보관
         valid_connections = []
 
         try:
@@ -811,32 +880,64 @@ class JDBCConnectionPool:
 
                 checked += 1
 
-                # Max Lifetime 초과 검사
                 if self._is_connection_expired(pooled_conn):
                     self._close_pooled_connection(pooled_conn)
                     recycled += 1
                     with self.lock:
                         self.total_recycled += 1
-                    # 새 커넥션 생성
                     new_conn = self._create_connection_internal()
                     if new_conn:
                         valid_connections.append(new_conn)
                     continue
 
-                # 유효성 검사
-                if self._validate_connection(pooled_conn):
+                idle_seconds = pooled_conn.get_idle_seconds()
+
+                if idle_seconds is not None and self.idle_timeout_seconds > 0:
+                    with self.lock:
+                        can_drop = self.current_size > self.min_size
+                    if can_drop and idle_seconds > self.idle_timeout_seconds:
+                        self._close_pooled_connection(pooled_conn)
+                        removed += 1
+                        continue
+
+                keepalive_checked = False
+                if idle_seconds is not None and self.keepalive_time_seconds > 0:
+                    if idle_seconds > self.keepalive_time_seconds:
+                        keepalive_checked = True
+                        if not self._validate_connection(pooled_conn):
+                            self._close_pooled_connection(pooled_conn)
+                            removed += 1
+                            new_conn = self._create_connection_internal()
+                            if new_conn:
+                                valid_connections.append(new_conn)
+                            continue
+                        pooled_conn.last_used_at = time.time()
+
+                if keepalive_checked or self._validate_connection(pooled_conn):
                     valid_connections.append(pooled_conn)
                 else:
                     self._close_pooled_connection(pooled_conn)
                     removed += 1
 
         finally:
-            # 유효한 커넥션 다시 풀에 추가
             for conn in valid_connections:
                 try:
                     self.pool.put_nowait(conn)
                 except queue.Full:
                     self._close_pooled_connection(conn)
+
+        while True:
+            with self.lock:
+                if self.current_size >= self.min_size:
+                    break
+            new_conn = self._create_connection_internal()
+            if not new_conn:
+                break
+            try:
+                self.pool.put_nowait(new_conn)
+            except queue.Full:
+                self._close_pooled_connection(new_conn)
+                break
 
         if removed > 0 or recycled > 0:
             logger.info(f"[Health Check] Checked: {checked}, Removed: {removed}, Recycled: {recycled}")
@@ -1139,11 +1240,19 @@ class OracleJDBCAdapter(DatabaseAdapter):
             raise RuntimeError("Oracle JDBC driver not found")
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
-        jdbc_url = JDBC_DRIVERS['oracle'].url_template.format(
-            host=config.host,
-            port=config.port or 1521,
-            sid=config.sid or config.database
-        )
+        if config.service_name:
+            jdbc_url = (
+                f"jdbc:oracle:thin:@//{config.host}:{config.port or 1521}/{config.service_name}"
+            )
+        else:
+            sid = config.sid or config.database
+            if not sid:
+                raise RuntimeError('Oracle SID or service name is required')
+            jdbc_url = JDBC_DRIVERS['oracle'].url_template.format(
+                host=config.host,
+                port=config.port or 1521,
+                sid=sid
+            )
 
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url,
@@ -1155,7 +1264,9 @@ class OracleJDBCAdapter(DatabaseAdapter):
             max_size=config.max_pool_size,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
-            idle_check_interval_seconds=config.idle_check_interval_seconds
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
         )
         return self.pool
 
@@ -1267,14 +1378,34 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
     def setup_schema(self, connection):
         cursor = connection.cursor()
         try:
-            try:
-                cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
-            except:
-                pass
-            try:
-                cursor.execute("DROP TABLE LOAD_TEST PURGE")
-            except:
-                pass
+            table_exists = False
+            seq_exists = False
+
+            cursor.execute("SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = 'LOAD_TEST'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                table_exists = True
+
+            cursor.execute("SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = 'LOAD_TEST_SEQ'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                seq_exists = True
+
+            if table_exists and seq_exists:
+                logger.info("Oracle schema already exists - reusing existing schema")
+                logger.info("  (DROP objects manually to recreate, or use --truncate to clear data only)")
+                return
+
+            if seq_exists:
+                try:
+                    cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+                except:
+                    pass
+            if table_exists:
+                try:
+                    cursor.execute("DROP TABLE LOAD_TEST PURGE")
+                except:
+                    pass
 
             cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
             cursor.execute("""
@@ -1288,9 +1419,24 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
             """)
             cursor.execute("ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)")
             cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL")
+            connection.commit()
             logger.info("Oracle schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup Oracle schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE LOAD_TEST")
+            cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+            cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
+            connection.commit()
+            logger.info("Table LOAD_TEST truncated and sequence LOAD_TEST_SEQ reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate Oracle table: {e}")
             raise
         finally:
             cursor.close()
@@ -1318,7 +1464,9 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
             min_size=config.min_pool_size, max_size=config.max_pool_size,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
-            idle_check_interval_seconds=config.idle_check_interval_seconds
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
         )
         return self.pool
 
@@ -1414,7 +1562,15 @@ CREATE TABLE load_test (
     def setup_schema(self, connection):
         cursor = connection.cursor()
         try:
-            cursor.execute("DROP TABLE IF EXISTS load_test CASCADE")
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'load_test'"
+            )
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                logger.info("PostgreSQL schema already exists - reusing existing schema")
+                logger.info("  (DROP TABLE load_test CASCADE to recreate, or use --truncate to clear data only)")
+                return
+
             cursor.execute("""
                 CREATE TABLE load_test (
                     id BIGSERIAL PRIMARY KEY, thread_id VARCHAR(50) NOT NULL,
@@ -1425,11 +1581,27 @@ CREATE TABLE load_test (
                 ) PARTITION BY HASH (id)
             """)
             for i in range(16):
-                cursor.execute(f"CREATE TABLE load_test_p{i:02d} PARTITION OF load_test FOR VALUES WITH (MODULUS 16, REMAINDER {i})")
+                cursor.execute(
+                    f"CREATE TABLE load_test_p{i:02d} PARTITION OF load_test "
+                    f"FOR VALUES WITH (MODULUS 16, REMAINDER {i})"
+                )
             cursor.execute("CREATE INDEX idx_load_test_thread ON load_test(thread_id, created_at)")
+            connection.commit()
             logger.info("PostgreSQL schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup PostgreSQL schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE load_test RESTART IDENTITY")
+            connection.commit()
+            logger.info("Table load_test truncated and sequence reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate PostgreSQL table: {e}")
             raise
         finally:
             cursor.close()
@@ -1490,7 +1662,9 @@ class MySQLJDBCAdapter(DatabaseAdapter):
             min_size=effective_min, max_size=effective_max,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
-            idle_check_interval_seconds=config.idle_check_interval_seconds
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
         )
         return self.pool
 
@@ -1587,7 +1761,15 @@ CREATE TABLE load_test (
     def setup_schema(self, connection):
         cursor = connection.cursor()
         try:
-            cursor.execute("DROP TABLE IF EXISTS load_test")
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'load_test'"
+            )
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                logger.info("MySQL schema already exists - reusing existing schema")
+                logger.info("  (DROP TABLE load_test to recreate, or use --truncate to clear data only)")
+                return
+
             cursor.execute("""
                 CREATE TABLE load_test (
                     id BIGINT NOT NULL AUTO_INCREMENT, thread_id VARCHAR(50) NOT NULL,
@@ -1599,9 +1781,22 @@ CREATE TABLE load_test (
                 ) ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 16
             """)
             cursor.execute("CREATE INDEX idx_load_test_thread ON load_test(thread_id, created_at)")
+            connection.commit()
             logger.info("MySQL schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup MySQL schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE load_test")
+            connection.commit()
+            logger.info("Table load_test truncated and AUTO_INCREMENT reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate MySQL table: {e}")
             raise
         finally:
             cursor.close()
@@ -1629,7 +1824,9 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
             min_size=config.min_pool_size, max_size=config.max_pool_size,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
-            idle_check_interval_seconds=config.idle_check_interval_seconds
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
         )
         return self.pool
 
@@ -1726,10 +1923,15 @@ CREATE TABLE load_test (
     def setup_schema(self, connection):
         cursor = connection.cursor()
         try:
-            try:
-                cursor.execute("DROP TABLE load_test")
-            except:
-                pass
+            cursor.execute(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'load_test'"
+            )
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                logger.info("SQL Server schema already exists - reusing existing schema")
+                logger.info("  (DROP TABLE load_test to recreate, or use --truncate to clear data only)")
+                return
+
             cursor.execute("""
                 CREATE TABLE load_test (
                     id BIGINT IDENTITY(1,1) NOT NULL, thread_id NVARCHAR(50) NOT NULL,
@@ -1739,9 +1941,23 @@ CREATE TABLE load_test (
                     CONSTRAINT PK_load_test PRIMARY KEY CLUSTERED (id)
                 )
             """)
+            cursor.execute("CREATE INDEX idx_load_test_thread ON load_test(thread_id, created_at)")
+            connection.commit()
             logger.info("SQL Server schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup SQL Server schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE load_test")
+            connection.commit()
+            logger.info("Table load_test truncated and IDENTITY reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate SQL Server table: {e}")
             raise
         finally:
             cursor.close()
@@ -1769,7 +1985,9 @@ class TiberoJDBCAdapter(DatabaseAdapter):
             min_size=config.min_pool_size, max_size=config.max_pool_size,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
-            idle_check_interval_seconds=config.idle_check_interval_seconds
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
         )
         return self.pool
 
@@ -1867,14 +2085,34 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
     def setup_schema(self, connection):
         cursor = connection.cursor()
         try:
-            try:
-                cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
-            except:
-                pass
-            try:
-                cursor.execute("DROP TABLE LOAD_TEST PURGE")
-            except:
-                pass
+            table_exists = False
+            seq_exists = False
+
+            cursor.execute("SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = 'LOAD_TEST'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                table_exists = True
+
+            cursor.execute("SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = 'LOAD_TEST_SEQ'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                seq_exists = True
+
+            if table_exists and seq_exists:
+                logger.info("Tibero schema already exists - reusing existing schema")
+                logger.info("  (DROP objects manually to recreate, or use --truncate to clear data only)")
+                return
+
+            if seq_exists:
+                try:
+                    cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+                except:
+                    pass
+            if table_exists:
+                try:
+                    cursor.execute("DROP TABLE LOAD_TEST PURGE")
+                except:
+                    pass
 
             cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
             cursor.execute("""
@@ -1888,9 +2126,221 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
             """)
             cursor.execute("ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID)")
             cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL")
+            connection.commit()
             logger.info("Tibero schema created successfully")
         except Exception as e:
             logger.error(f"Failed to setup Tibero schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE LOAD_TEST")
+            cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+            cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
+            connection.commit()
+            logger.info("Table LOAD_TEST truncated and sequence LOAD_TEST_SEQ reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate Tibero table: {e}")
+            raise
+        finally:
+            cursor.close()
+
+
+# ============================================================================
+# DB2 JDBC Adapter
+# ============================================================================
+class DB2JDBCAdapter(DatabaseAdapter):
+    """IBM DB2 JDBC adapter"""
+
+    def __init__(self, jre_dir: str = './jre'):
+        self.pool = None
+        self.jar_file = find_jdbc_jar('db2', jre_dir)
+        if not self.jar_file:
+            raise RuntimeError("DB2 JDBC driver not found")
+
+    def create_connection_pool(self, config: 'DatabaseConfig'):
+        jdbc_url = JDBC_DRIVERS['db2'].url_template.format(
+            host=config.host, port=config.port or 50000, database=config.database
+        )
+        self.pool = JDBCConnectionPool(
+            jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['db2'].driver_class,
+            jar_file=self.jar_file, user=config.user, password=config.password,
+            min_size=config.min_pool_size, max_size=config.max_pool_size,
+            max_lifetime_seconds=config.max_lifetime_seconds,
+            leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
+            idle_check_interval_seconds=config.idle_check_interval_seconds,
+            idle_timeout_seconds=config.idle_timeout_seconds,
+            keepalive_time_seconds=config.keepalive_time_seconds
+        )
+        return self.pool
+
+    def get_connection(self):
+        return self.pool.acquire()
+
+    def release_connection(self, connection, is_error: bool = False):
+        if connection:
+            try:
+                if is_error:
+                    connection.rollback()
+                self.pool.release(connection)
+            except:
+                pass
+
+    def discard_connection(self, connection):
+        if connection:
+            self.pool.discard(connection)
+
+    def close_pool(self):
+        if self.pool:
+            self.pool.close_all()
+
+    def get_pool_stats(self) -> Dict[str, int]:
+        return self.pool.get_pool_stats() if self.pool else {}
+
+    def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
+        cursor.execute("""
+            INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
+            VALUES (NEXT VALUE FOR LOAD_TEST_SEQ, ?, ?, ?, CURRENT TIMESTAMP)
+        """, [thread_id, f'TEST_{thread_id}', random_data])
+
+        cursor.execute("SELECT PREVIOUS VALUE FOR LOAD_TEST_SEQ FROM SYSIBM.SYSDUMMY1")
+        result = cursor.fetchone()
+        return int(result[0]) if result else -1
+
+    def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        for _ in range(batch_size):
+            cursor.execute("""
+                INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
+                VALUES (NEXT VALUE FOR LOAD_TEST_SEQ, ?, ?, ?, CURRENT TIMESTAMP)
+            """, [thread_id, f'TEST_{thread_id}', random_data])
+        return batch_size
+
+    def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
+        return cursor.fetchone()
+
+    def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        if max_id <= 0:
+            return None
+        random_id = random.randint(1, max_id)
+        cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [random_id])
+        return cursor.fetchone()
+
+    def execute_update(self, cursor, record_id: int) -> bool:
+        cursor.execute(
+            "UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = CURRENT TIMESTAMP WHERE ID = ?",
+            [f'UPDATED_{record_id}', record_id]
+        )
+        return cursor.rowcount > 0
+
+    def execute_delete(self, cursor, record_id: int) -> bool:
+        cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
+        return cursor.rowcount > 0
+
+    def get_max_id(self, cursor) -> int:
+        cursor.execute("SELECT COALESCE(MAX(ID), 0) FROM LOAD_TEST")
+        result = cursor.fetchone()
+        return int(result[0]) if result else 0
+
+    def get_random_id(self, cursor, max_id: int) -> int:
+        return random.randint(1, max_id) if max_id > 0 else 0
+
+    def commit(self, connection):
+        connection.commit()
+
+    def rollback(self, connection):
+        try:
+            connection.rollback()
+        except:
+            pass
+
+    def get_ddl(self) -> str:
+        return """
+-- IBM DB2 DDL
+CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NO CYCLE ORDER;
+
+CREATE TABLE LOAD_TEST (
+    ID           BIGINT          NOT NULL,
+    THREAD_ID    VARCHAR(50)     NOT NULL,
+    VALUE_COL    VARCHAR(200),
+    RANDOM_DATA  VARCHAR(1000),
+    STATUS       VARCHAR(20)     DEFAULT 'ACTIVE',
+    CREATED_AT   TIMESTAMP       DEFAULT CURRENT TIMESTAMP,
+    UPDATED_AT   TIMESTAMP       DEFAULT CURRENT TIMESTAMP,
+    PRIMARY KEY (ID)
+);
+
+CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT);
+"""
+
+    def setup_schema(self, connection):
+        cursor = connection.cursor()
+        try:
+            table_exists = False
+            seq_exists = False
+
+            cursor.execute("SELECT COUNT(*) FROM SYSCAT.TABLES WHERE TABNAME = 'LOAD_TEST'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                table_exists = True
+
+            cursor.execute("SELECT COUNT(*) FROM SYSCAT.SEQUENCES WHERE SEQNAME = 'LOAD_TEST_SEQ'")
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                seq_exists = True
+
+            if table_exists and seq_exists:
+                logger.info("DB2 schema already exists - reusing existing schema")
+                logger.info("  (DROP objects manually to recreate, or use --truncate to clear data only)")
+                return
+
+            if seq_exists:
+                try:
+                    cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+                except:
+                    pass
+            if table_exists:
+                try:
+                    cursor.execute("DROP TABLE LOAD_TEST")
+                except:
+                    pass
+
+            cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NO CYCLE ORDER")
+            cursor.execute("""
+                CREATE TABLE LOAD_TEST (
+                    ID BIGINT NOT NULL,
+                    THREAD_ID VARCHAR(50) NOT NULL,
+                    VALUE_COL VARCHAR(200),
+                    RANDOM_DATA VARCHAR(1000),
+                    STATUS VARCHAR(20) DEFAULT 'ACTIVE',
+                    CREATED_AT TIMESTAMP DEFAULT CURRENT TIMESTAMP,
+                    UPDATED_AT TIMESTAMP DEFAULT CURRENT TIMESTAMP,
+                    PRIMARY KEY (ID)
+                )
+            """)
+            cursor.execute("CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT)")
+            connection.commit()
+            logger.info("DB2 schema created successfully")
+        except Exception as e:
+            logger.error(f"Failed to setup DB2 schema: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def truncate_table(self, connection):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("TRUNCATE TABLE LOAD_TEST IMMEDIATE")
+            cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+            cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NO CYCLE ORDER")
+            connection.commit()
+            logger.info("Table LOAD_TEST truncated and sequence LOAD_TEST_SEQ reset to 1")
+        except Exception as e:
+            logger.error(f"Failed to truncate DB2 table: {e}")
             raise
         finally:
             cursor.close()
@@ -1924,6 +2374,7 @@ class DatabaseConfig:
     password: str
     database: Optional[str] = None
     sid: Optional[str] = None
+    service_name: Optional[str] = None
     port: Optional[int] = None
     min_pool_size: int = 100
     max_pool_size: int = 200
@@ -1932,6 +2383,8 @@ class DatabaseConfig:
     max_lifetime_seconds: int = 1800  # 30분
     leak_detection_threshold_seconds: int = 60  # 60초
     idle_check_interval_seconds: int = 30  # 30초
+    idle_timeout_seconds: int = 30
+    keepalive_time_seconds: int = 30
 
 
 # ============================================================================
@@ -1939,6 +2392,9 @@ class DatabaseConfig:
 # ============================================================================
 class LoadTestWorker:
     """부하 테스트 워커 - 전체 기능 지원"""
+    ERROR_LOG_INTERVAL_MS = 10000
+    MAX_CONNECTION_RETRIES = 3
+    MAX_BACKOFF_MS = 5000
 
     def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
                  mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
@@ -1953,15 +2409,77 @@ class LoadTestWorker:
         self.ramp_up_end_time = ramp_up_end_time
         self.thread_name = f"Worker-{worker_id:04d}"
         self.transaction_count = 0
+        self.last_error_log_time = 0
+        self.suppressed_error_count = 0
+        self.current_backoff_ms = 100
 
     def generate_random_data(self, length: int = 500) -> str:
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
     def is_during_ramp_up(self) -> bool:
-        """Ramp-up 기간인지 확인"""
+        """Ramp-up ???? ??"""
         if self.ramp_up_end_time is None:
             return False
         return datetime.now() < self.ramp_up_end_time
+
+    def _is_connection_valid(self, connection) -> bool:
+        try:
+            if connection is None:
+                return False
+            jconn = connection.jconn
+            if hasattr(jconn, 'isValid'):
+                return jconn.isValid(2)
+            return True
+        except Exception:
+            return False
+
+    def _get_valid_connection(self):
+        for retry in range(self.MAX_CONNECTION_RETRIES):
+            try:
+                conn = self.db_adapter.get_connection()
+                if conn and self._is_connection_valid(conn):
+                    self.current_backoff_ms = 100
+                    return conn
+                if conn:
+                    self.db_adapter.discard_connection(conn)
+                    perf_counter.increment_connection_recreate()
+            except Exception:
+                pass
+
+            if retry < self.MAX_CONNECTION_RETRIES - 1:
+                time.sleep(self.current_backoff_ms / 1000.0)
+                self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
+
+        return self.db_adapter.get_connection()
+
+    def reset_backoff(self):
+        self.current_backoff_ms = 100
+
+    def log_error(self, operation: str, message: str):
+        if message and (
+            'Connection is closed' in message or
+            'connection is closed' in message or
+            'Already closed' in message or
+            'No operations allowed after connection closed' in message or
+            'Connection is not available' in message or
+            'request timed out' in message
+        ):
+            logger.debug(f"[{self.thread_name}] {operation} (suppressed): {message}")
+            return
+
+        now_ms = int(time.time() * 1000)
+        if now_ms - self.last_error_log_time > self.ERROR_LOG_INTERVAL_MS:
+            if self.suppressed_error_count > 0:
+                logger.warning(
+                    f"[{self.thread_name}] {operation} error (suppressed {self.suppressed_error_count} similar errors): {message}"
+                )
+            else:
+                logger.warning(f"[{self.thread_name}] {operation} error: {message}")
+            self.last_error_log_time = now_ms
+            self.suppressed_error_count = 0
+        else:
+            self.suppressed_error_count += 1
+            logger.debug(f"[{self.thread_name}] {operation} error: {message}")
 
     def execute_insert(self, connection) -> bool:
         cursor = None
@@ -1985,7 +2503,7 @@ class LoadTestWorker:
             self.transaction_count += 1
             return True
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Insert error: {str(e)}")
+            self.log_error("Insert", str(e))
             perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
@@ -2009,7 +2527,7 @@ class LoadTestWorker:
             self.transaction_count += 1
             return True
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Select error: {str(e)}")
+            self.log_error("Select", str(e))
             perf_counter.increment_error()
             return False
         finally:
@@ -2025,9 +2543,10 @@ class LoadTestWorker:
         try:
             cursor = connection.cursor()
             record_id = self.db_adapter.get_random_id(cursor, max_id)
-            if record_id > 0:
-                self.db_adapter.execute_update(cursor, record_id)
-                self.db_adapter.commit(connection)
+            if record_id <= 0:
+                return True
+            self.db_adapter.execute_update(cursor, record_id)
+            self.db_adapter.commit(connection)
             perf_counter.increment_update()
 
             latency_ms = (time.time() - start_time) * 1000
@@ -2035,7 +2554,7 @@ class LoadTestWorker:
             self.transaction_count += 1
             return True
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Update error: {str(e)}")
+            self.log_error("Update", str(e))
             perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
@@ -2052,9 +2571,10 @@ class LoadTestWorker:
         try:
             cursor = connection.cursor()
             record_id = self.db_adapter.get_random_id(cursor, max_id)
-            if record_id > 0:
-                self.db_adapter.execute_delete(cursor, record_id)
-                self.db_adapter.commit(connection)
+            if record_id <= 0:
+                return True
+            self.db_adapter.execute_delete(cursor, record_id)
+            self.db_adapter.commit(connection)
             perf_counter.increment_delete()
 
             latency_ms = (time.time() - start_time) * 1000
@@ -2062,7 +2582,7 @@ class LoadTestWorker:
             self.transaction_count += 1
             return True
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Delete error: {str(e)}")
+            self.log_error("Delete", str(e))
             perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
@@ -2105,12 +2625,20 @@ class LoadTestWorker:
                 perf_counter.increment_verification_failure()
                 return False
 
+            self.db_adapter.execute_update(cursor, new_id)
+            perf_counter.increment_update()
+            self.db_adapter.commit(connection)
+
+            self.db_adapter.execute_delete(cursor, new_id)
+            perf_counter.increment_delete()
+            self.db_adapter.commit(connection)
+
             latency_ms = (time.time() - start_time) * 1000
             perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
-            logger.error(f"[{self.thread_name}] Transaction error: {str(e)}")
+            self.log_error("Transaction", str(e))
             perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
@@ -2140,17 +2668,23 @@ class LoadTestWorker:
 
             try:
                 if connection is None:
-                    connection = self.db_adapter.get_connection()
+                    connection = self._get_valid_connection()
                     consecutive_errors = 0
+                else:
+                    if not self._is_connection_valid(connection):
+                        self.db_adapter.discard_connection(connection)
+                        connection = self._get_valid_connection()
+                        perf_counter.increment_connection_recreate()
 
-                    if self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
-                                     WorkMode.DELETE_ONLY, WorkMode.MIXED] and max_id == 0:
-                        cursor = connection.cursor()
-                        max_id = self.db_adapter.get_max_id(cursor)
-                        cursor.close()
-                        if max_id == 0:
-                            time.sleep(1)
-                            continue
+                needs_data = self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
+                                           WorkMode.DELETE_ONLY, WorkMode.MIXED]
+                if needs_data and (max_id == 0 or self.transaction_count % 100 == 0):
+                    cursor = connection.cursor()
+                    max_id = self.db_adapter.get_max_id(cursor)
+                    cursor.close()
+                    if max_id == 0:
+                        time.sleep(1)
+                        continue
 
                 # 모드별 실행
                 if self.mode == WorkMode.INSERT_ONLY:
@@ -2168,22 +2702,25 @@ class LoadTestWorker:
 
                 if not success:
                     consecutive_errors += 1
-                    if consecutive_errors >= 5:
+                    if consecutive_errors >= 2:
                         self.db_adapter.discard_connection(connection)
                         connection = None
                         perf_counter.increment_connection_recreate()
-                        time.sleep(0.5)
+                        time.sleep(self.current_backoff_ms / 1000.0)
+                        self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
                 else:
                     consecutive_errors = 0
+                    self.reset_backoff()
 
             except Exception as e:
-                logger.error(f"[{self.thread_name}] Error: {str(e)}")
+                self.log_error("Connection", str(e))
                 perf_counter.increment_error()
                 if connection:
                     self.db_adapter.discard_connection(connection)
                     connection = None
                     perf_counter.increment_connection_recreate()
-                time.sleep(0.5)
+                time.sleep(self.current_backoff_ms / 1000.0)
+                self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
 
         if connection:
             self.db_adapter.release_connection(connection)
@@ -2206,6 +2743,7 @@ class MonitorThread(threading.Thread):
         self.sub_second_interval_ms = sub_second_interval_ms
         self.db_adapter = db_adapter
         self.running = True
+        self.warmup_end_logged = False
 
     def run(self):
         logger.info(f"[Monitor] Starting (interval: {self.interval_seconds}s)")
@@ -2216,26 +2754,40 @@ class MonitorThread(threading.Thread):
 
             time.sleep(self.interval_seconds)
 
-            stats = perf_counter.get_stats()
             interval_stats = perf_counter.get_interval_stats()
+            stats = perf_counter.get_stats()
             latency_stats = perf_counter.get_latency_stats()
             pool_stats = self.db_adapter.get_pool_stats()
 
             realtime_tps = perf_counter.get_sub_second_tps()
-            windowed_tps = perf_counter.get_windowed_tps(self.sub_second_interval_ms)
+            is_warmup = perf_counter.is_warmup_period()
+            has_warmup = perf_counter.has_warmup_config()
 
-            warmup_indicator = "[WARMUP] " if perf_counter.is_warmup_period() else ""
+            if has_warmup and not is_warmup and not self.warmup_end_logged:
+                self.warmup_end_logged = True
+                logger.info("=" * 80)
+                logger.info("[Monitor] *** WARMUP COMPLETED *** Starting measurement phase...")
+                logger.info("=" * 80)
+
+            status_indicator = "[WARMUP]  " if is_warmup else "[RUNNING] "
+
+            if is_warmup:
+                avg_tps_str = "-"
+            elif has_warmup:
+                avg_tps_str = f"{round(stats['post_warmup_tps'])}"
+            else:
+                avg_tps_str = f"{round(stats['avg_tps'])}"
 
             logger.info(
-                f"[Monitor] {warmup_indicator}"
-                f"TXN: {stats['total_transactions']:,} | "
-                f"INS: {stats['total_inserts']:,} | "
-                f"SEL: {stats['total_selects']:,} | "
-                f"UPD: {stats['total_updates']:,} | "
-                f"DEL: {stats['total_deletes']:,} | "
-                f"ERR: {stats['total_errors']:,} | "
-                f"Avg TPS: {stats['avg_tps']:.1f} | "
-                f"RT TPS: {realtime_tps:.1f} | "
+                f"[Monitor] {status_indicator}"
+                f"TXN: {interval_stats['interval_transactions']:,} | "
+                f"INS: {interval_stats['interval_inserts']:,} | "
+                f"SEL: {interval_stats['interval_selects']:,} | "
+                f"UPD: {interval_stats['interval_updates']:,} | "
+                f"DEL: {interval_stats['interval_deletes']:,} | "
+                f"ERR: {interval_stats['interval_errors']:,} | "
+                f"Avg TPS: {avg_tps_str} | "
+                f"RT TPS: {round(realtime_tps)} | "
                 f"Lat(p95/p99): {latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
                 f"Pool: {pool_stats.get('pool_active', 0)}/{pool_stats.get('pool_total', 0)}"
             )
@@ -2267,7 +2819,8 @@ class MultiDBLoadTester:
             'postgresql': PostgreSQLJDBCAdapter, 'postgres': PostgreSQLJDBCAdapter, 'pg': PostgreSQLJDBCAdapter,
             'mysql': MySQLJDBCAdapter,
             'sqlserver': SQLServerJDBCAdapter, 'mssql': SQLServerJDBCAdapter,
-            'tibero': TiberoJDBCAdapter
+            'tibero': TiberoJDBCAdapter,
+            'db2': DB2JDBCAdapter
         }
 
         if db_type not in adapters:
@@ -2284,8 +2837,9 @@ class MultiDBLoadTester:
 
     def run_load_test(self, thread_count: int, duration_seconds: int,
                       mode: str = WorkMode.FULL, skip_schema_setup: bool = False,
-                      monitor_interval: float = 5.0, sub_second_interval_ms: int = 100,
-                      warmup_seconds: int = 0, ramp_up_seconds: int = 0,
+                      truncate_table: bool = False,
+                      monitor_interval: float = 1.0, sub_second_interval_ms: int = 100,
+                      warmup_seconds: int = 30, ramp_up_seconds: int = 0,
                       target_tps: int = 0, batch_size: int = 1,
                       output_format: str = None, output_file: str = None):
         """부하 테스트 실행"""
@@ -2302,15 +2856,26 @@ class MultiDBLoadTester:
         # 커넥션 풀 생성
         self.db_adapter.create_connection_pool(self.config)
 
-        # 스키마 설정
+        # 스키마 설정 (기존 스키마가 있으면 재사용)
         if not skip_schema_setup:
             logger.info("Setting up database schema...")
             conn = self.db_adapter.get_connection()
             try:
                 self.db_adapter.setup_schema(conn)
-                self.db_adapter.commit(conn)
             except Exception as e:
                 logger.error(f"Schema setup failed: {e}")
+                self.db_adapter.release_connection(conn)
+                sys.exit(1)
+            finally:
+                self.db_adapter.release_connection(conn)
+
+        if truncate_table:
+            logger.info("Truncating table...")
+            conn = self.db_adapter.get_connection()
+            try:
+                self.db_adapter.truncate_table(conn)
+            except Exception as e:
+                logger.error(f"Table truncate failed: {e}")
                 self.db_adapter.release_connection(conn)
                 sys.exit(1)
             finally:
@@ -2328,14 +2893,24 @@ class MultiDBLoadTester:
 
         # 시간 설정
         now = datetime.now()
-        warmup_end_time = now + timedelta(seconds=warmup_seconds) if warmup_seconds > 0 else now
-        ramp_up_end_time = warmup_end_time + timedelta(seconds=ramp_up_seconds) if ramp_up_seconds > 0 else None
+        warmup_end_time = now + timedelta(seconds=warmup_seconds) if warmup_seconds > 0 else None
+        ramp_up_end_time = (warmup_end_time or now) + timedelta(seconds=ramp_up_seconds) if ramp_up_seconds > 0 else None
         end_time = now + timedelta(seconds=duration_seconds + warmup_seconds)
 
         # 워밍업 설정
         if warmup_seconds > 0:
             perf_counter.set_warmup_end_time(warmup_end_time.timestamp())
-            logger.info(f"Warmup period: {warmup_seconds} seconds")
+            logger.info("=" * 80)
+            logger.info("Warmup period: %s seconds (Avg TPS will be calculated after warmup)", warmup_seconds)
+            logger.info(
+                "Total test duration: %s seconds (warmup) + %s seconds (measurement) = %s seconds",
+                warmup_seconds, duration_seconds, warmup_seconds + duration_seconds
+            )
+            logger.info("=" * 80)
+        else:
+            logger.info("=" * 80)
+            logger.info("No warmup period. Test duration: %s seconds", duration_seconds)
+            logger.info("=" * 80)
 
         # Rate limiter
         rate_limiter = RateLimiter(target_tps) if target_tps > 0 else None
@@ -2424,10 +2999,10 @@ class MultiDBLoadTester:
         logger.info(f"Total Errors: {final_stats['total_errors']:,}")
         logger.info(f"Verification Failures: {final_stats['verification_failures']:,}")
         logger.info("-" * 80)
-        logger.info(f"Average TPS (overall): {final_stats['avg_tps']:.2f}")
+        logger.info(f"Average TPS (overall): {round(final_stats['avg_tps'])}")
         if warmup_seconds > 0:
-            logger.info(f"Average TPS (post-warmup): {final_stats['post_warmup_tps']:.2f}")
-        logger.info(f"Realtime TPS (last 1s): {final_stats['realtime_tps']:.2f}")
+            logger.info(f"Average TPS (post-warmup): {round(final_stats['post_warmup_tps'])}")
+        logger.info(f"Realtime TPS (last 1s): {round(final_stats['realtime_tps'])}")
 
         if final_stats['total_transactions'] > 0:
             success_rate = (1 - final_stats['total_errors'] / final_stats['total_transactions']) * 100
@@ -2465,11 +3040,11 @@ class MultiDBLoadTester:
 # ============================================================================
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Multi-Database Load Tester v2.0 (JDBC)',
+        description='Multi-Database Load Tester v2.2 (JDBC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Work Modes:
-  full        : INSERT -> COMMIT -> SELECT (default)
+  full        : INSERT -> SELECT -> UPDATE -> DELETE (default)
   insert-only : INSERT -> COMMIT only
   select-only : SELECT only (requires existing data)
   update-only : UPDATE only (requires existing data)
@@ -2501,7 +3076,7 @@ Examples:
 
     # 필수 옵션
     parser.add_argument('--db-type', required=True,
-                        choices=['oracle', 'postgresql', 'postgres', 'pg', 'mysql', 'sqlserver', 'mssql', 'tibero'])
+                        choices=['oracle', 'postgresql', 'postgres', 'pg', 'mysql', 'sqlserver', 'mssql', 'tibero', 'db2'])
     parser.add_argument('--host', required=True)
     parser.add_argument('--user', required=True)
     parser.add_argument('--password', required=True)
@@ -2510,6 +3085,7 @@ Examples:
     parser.add_argument('--port', type=int)
     parser.add_argument('--database')
     parser.add_argument('--sid')
+    parser.add_argument('--service-name')
     parser.add_argument('--jre-dir', default='./jre')
 
     # 풀 설정
@@ -2523,6 +3099,10 @@ Examples:
                         help='Leak detection threshold in seconds (default: 60)')
     parser.add_argument('--idle-check-interval', type=int, default=30,
                         help='Idle connection health check interval in seconds (default: 30)')
+    parser.add_argument('--idle-timeout', type=int, default=30,
+                        help='Idle connection timeout in seconds (default: 30)')
+    parser.add_argument('--keepalive-time', type=int, default=30,
+                        help='Keepalive interval for idle connections in seconds (default: 30, min: 30)')
 
     # 테스트 설정
     parser.add_argument('--thread-count', type=int, default=100)
@@ -2531,15 +3111,17 @@ Examples:
                                            WorkMode.UPDATE_ONLY, WorkMode.DELETE_ONLY, WorkMode.MIXED],
                         default=WorkMode.FULL)
     parser.add_argument('--skip-schema-setup', action='store_true')
+    parser.add_argument('--truncate', action='store_true',
+                        help='Truncate table before test (clears data, resets identity/sequence)')
 
     # 고급 설정
-    parser.add_argument('--warmup', type=int, default=0, help='Warmup period in seconds')
+    parser.add_argument('--warmup', type=int, default=30, help='Warmup period in seconds')
     parser.add_argument('--ramp-up', type=int, default=0, help='Ramp-up period in seconds')
     parser.add_argument('--target-tps', type=int, default=0, help='Target TPS (0 = unlimited)')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch INSERT size')
 
     # 모니터링
-    parser.add_argument('--monitor-interval', type=float, default=5.0)
+    parser.add_argument('--monitor-interval', type=float, default=1.0)
     parser.add_argument('--sub-second-interval', type=int, default=100)
 
     # 결과 내보내기
@@ -2549,6 +3131,7 @@ Examples:
     # 기타
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
     parser.add_argument('--print-ddl', action='store_true')
+    parser.add_argument('--version', action='store_true', help='Show version and exit')
 
     return parser.parse_args()
 
@@ -2557,6 +3140,10 @@ Examples:
 # 메인 함수
 # ============================================================================
 def main():
+    if '--version' in sys.argv:
+        print(f"Multi-Database Load Tester v{VERSION} (JDBC)")
+        return
+
     args = parse_arguments()
 
     if not JAYDEBEAPI_AVAILABLE:
@@ -2565,15 +3152,21 @@ def main():
 
     logger.setLevel(getattr(logging, args.log_level))
 
+    if args.version:
+        print(f"Multi-Database Load Tester v{VERSION} (JDBC)")
+        return
+
     config = DatabaseConfig(
         db_type=args.db_type, host=args.host, port=args.port,
-        database=args.database, sid=args.sid,
+        database=args.database, sid=args.sid, service_name=args.service_name,
         user=args.user, password=args.password,
         min_pool_size=args.min_pool_size, max_pool_size=args.max_pool_size,
         jre_dir=args.jre_dir,
         max_lifetime_seconds=args.max_lifetime,
         leak_detection_threshold_seconds=args.leak_detection_threshold,
-        idle_check_interval_seconds=args.idle_check_interval
+        idle_check_interval_seconds=args.idle_check_interval,
+        idle_timeout_seconds=args.idle_timeout,
+        keepalive_time_seconds=args.keepalive_time
     )
 
     initialize_jvm(args.jre_dir)
@@ -2594,12 +3187,10 @@ def main():
 
     # 설정 출력
     logger.info("=" * 80)
-    logger.info("MULTI-DATABASE LOAD TESTER v2.0 (JDBC)")
+    logger.info(f"MULTI-DATABASE LOAD TESTER v{VERSION} (JDBC)")
     logger.info("=" * 80)
     logger.info(f"Database: {config.db_type.upper()} @ {config.host}")
     logger.info(f"Threads: {args.thread_count} | Duration: {args.test_duration}s | Mode: {args.mode}")
-    if args.warmup > 0:
-        logger.info(f"Warmup: {args.warmup}s")
     if args.ramp_up > 0:
         logger.info(f"Ramp-up: {args.ramp_up}s")
     if args.target_tps > 0:
@@ -2614,6 +3205,7 @@ def main():
             duration_seconds=args.test_duration,
             mode=args.mode,
             skip_schema_setup=args.skip_schema_setup,
+            truncate_table=args.truncate,
             monitor_interval=args.monitor_interval,
             sub_second_interval_ms=args.sub_second_interval,
             warmup_seconds=args.warmup,
