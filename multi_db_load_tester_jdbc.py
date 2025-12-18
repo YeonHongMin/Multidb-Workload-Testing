@@ -545,7 +545,7 @@ JDBC_DRIVERS = {
     ),
     'db2': JDBCDriverInfo(
         driver_class='com.ibm.db2.jcc.DB2Driver',
-        jar_pattern='jcc*.jar',
+        jar_pattern='*jcc*.jar',
         url_template='jdbc:db2://{host}:{port}/{database}'
     )
 }

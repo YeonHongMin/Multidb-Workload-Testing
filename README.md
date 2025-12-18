@@ -1,10 +1,10 @@
 # Multi-Database Load Tester v2.2 (Python & JDBC Driver)
 
-Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
+Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
 ## 주요 특징
 
-- **5개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero
+- **6개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2
 - **JDBC 드라이버 사용**: JayDeBeApi를 통한 통합 JDBC 연결
 - **고성능 멀티스레딩**: 최대 1000개 동시 세션 지원
 - **6가지 작업 모드**: full, insert-only, select-only, update-only, delete-only, mixed
@@ -35,6 +35,7 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티�
   - MySQL 5.7+
   - SQL Server 2016+
   - Tibero 6+
+  - DB2 11.5+
 
 ## 설치
 
@@ -58,8 +59,10 @@ pip install -r requirements.txt
 │   └── postgresql-42.7.0.jar
 ├── mysql/
 │   └── mysql-connector-j-8.0.33.jar
-└── sqlserver/
-    └── mssql-jdbc-12.4.0.jre11.jar
+├── sqlserver/
+│   └── mssql-jdbc-12.4.0.jre11.jar
+└── db2/
+    └── db2jcc4.jar
 ```
 
 ## 사용법
@@ -416,6 +419,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 | MySQL      | mysql-connector | AUTO_INCREMENT | HASH 16개 | 최대 32개 |
 | SQL Server | mssql-jdbc      | IDENTITY       | -         | -         |
 | Tibero     | tibero-jdbc     | SEQUENCE       | HASH 16개 | -         |
+| DB2        | db2jcc          | SEQUENCE       | HASH 16개 | -         |
 
 ## 환경 변수 설정
 
@@ -447,6 +451,7 @@ chmod +x run_*.sh
 ./run_mysql_jdbc_test.sh
 ./run_sqlserver_jdbc_test.sh
 ./run_tibero_jdbc_test.sh
+./run_db2_jdbc_test.sh
 ```
 
 ## Graceful Shutdown
@@ -469,7 +474,7 @@ chmod +x run_*.sh
 ### JDBC 드라이버 찾을 수 없음
 
 - `./jre` 디렉터리 구조 확인
-- JAR 파일명 패턴 확인 (ojdbc\*.jar 등)
+- JAR 파일명 패턴 확인 (예: ojdbc\*.jar, postgresql-\*.jar, \*jcc\*.jar)
 
 ### 커넥션 풀 부족
 
@@ -500,6 +505,6 @@ MIT License
 
 ## Python JDBC Notes
 
-- Added DB2 support (db-type: `db2`, default port: `50000`, JDBC JAR: `./jre/db2/jcc*.jar`).
+- Added DB2 support (db-type: `db2`, default port: `50000`, JDBC JAR: `./jre/db2/*jcc*.jar` e.g. `db2jcc4.jar`).
 - New options: `--truncate`, `--idle-timeout`, `--keepalive-time`.
 - Defaults aligned with Java version: warmup `30s`, monitor interval `1.0s`.

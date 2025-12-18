@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep this file itself LF (avoid flip-flopping with core.autocrlf)
+.gitattributes text eol=lf
+
+# Shell scripts must stay LF to avoid /bin/bash^M errors (esp. on Windows)
+*.sh text eol=lf

@@ -17,9 +17,9 @@ JRE_DIR="./jre"
 
 # Check JDBC driver
 echo "Checking DB2 JDBC driver..."
-if ! ls ./jre/db2/jcc*.jar 1> /dev/null 2>&1; then
+if ! ls ./jre/db2/*jcc*.jar 1> /dev/null 2>&1; then
     echo "ERROR: DB2 JDBC driver not found in ./jre/db2/"
-    echo "Place jcc*.jar under ./jre/db2/"
+    echo "Place DB2 JDBC driver JAR under ./jre/db2/ (e.g. db2jcc4.jar)"
     exit 1
 fi
 
