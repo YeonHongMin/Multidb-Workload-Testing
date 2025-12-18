@@ -1,10 +1,10 @@
 # Multi-Database Load Tester v2.2 (Python & JDBC Driver)
 
-Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
+Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
 ## 주요 특징
 
-- **6개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2
+- **5개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero
 - **JDBC 드라이버 사용**: JayDeBeApi를 통한 통합 JDBC 연결
 - **고성능 멀티스레딩**: 최대 1000개 동시 세션 지원
 - **6가지 작업 모드**: full, insert-only, select-only, update-only, delete-only, mixed
@@ -35,7 +35,6 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2를 지원하는 고성능 멀
   - MySQL 5.7+
   - SQL Server 2016+
   - Tibero 6+
-  - DB2 11.5+
 
 ## 설치
 
@@ -59,10 +58,59 @@ pip install -r requirements.txt
 │   └── postgresql-42.7.0.jar
 ├── mysql/
 │   └── mysql-connector-j-8.0.33.jar
-├── sqlserver/
-│   └── mssql-jdbc-12.4.0.jre11.jar
-└── db2/
-    └── db2jcc4.jar
+└── sqlserver/
+    └── mssql-jdbc-12.4.0.jre11.jar
+```
+
+## Linux client/server 실행 절차
+
+이 도구는 "클라이언트(Linux, Python 실행)"에서 실행하며, DB는 별도 "서버(Linux/Unix, DB 구동)"에 있어도 됩니다.
+
+### 1) 서버(DB) 준비
+
+- DB 서버에 대상 DB 설치/구동, 사용자 계정/비밀번호 준비
+- 클라이언트에서 DB 포트 접근 가능하도록 방화벽/보안그룹 설정
+- 예: Oracle 1521, PostgreSQL 5432, MySQL 3306, SQL Server 1433, Tibero 8629
+
+### 2) 클라이언트 준비 (Linux)
+
+- Python 3.10+, Java JDK 17+ 설치
+- 본 리포지토리 클론 또는 파일 복사
+- JDBC 드라이버를 `./jre/<db>`에 배치
+
+### 3) (권장) Python 가상환경 구성
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4) 실행
+
+```bash
+python multi_db_load_tester_jdbc.py \
+    --db-type postgresql \
+    --host <DB_SERVER_IP> --port 5432 --database testdb \
+    --user test_user --password test_pass \
+    --thread-count 100 --test-duration 60
+```
+
+### 5) (선택) 스크립트로 실행
+
+```bash
+chmod +x run_*.sh
+./run_postgresql_jdbc_test.sh
+```
+
+### 6) 환경 변수 방식 (선택)
+
+`env.example`을 참고해 `.env` 구성 후 실행:
+
+```bash
+cp env.example .env
+# 필요 값 수정 후 실행
+python multi_db_load_tester_jdbc.py --db-type postgresql ...
 ```
 
 ## 사용법
@@ -74,8 +122,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test_user --password test_pass \
-    --thread-count 100 --test-duration 60 \
-    --truncate
+    --thread-count 100 --test-duration 60
 ```
 
 ```bash
@@ -357,7 +404,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 ## 모니터링 출력 예시
 
 ```
-12:34:56 - [Monitor] [RUNNING] TXN: 45,230 | INS: 45,230 | SEL: 45,230 | UPD: 0 | DEL: 0 | ERR: 0 | Avg TPS: 1508 | RT TPS: 1523 | Lat(p50/p95/p99): 2.3/4.5/8.2ms | Pool: 95/100
+12:34:56 - [Monitor] [RUNNING] TXN: 45,230 | INS: 45,230 | SEL: 45,230 | UPD: 0 | DEL: 0 | ERR: 0 | Avg TPS: 1508 | RT TPS: 1523 | Lat(p95/p99): 4.5/8.2ms | Pool: 95/100
 ```
 
 | 지표      | 설명                         |
@@ -370,7 +417,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 | ERR       | 총 에러 수                   |
 | Avg TPS   | Average TPS (rounded) |
 | RT TPS    | Realtime TPS (rounded) |
-| Lat       | Latency p50/p95/p99 (ms) |
+| Lat       | Latency p95/p99 (ms) |
 | Pool      | 커넥션 풀 상태 (사용중/전체) |
 
 ## 결과 파일 형식
@@ -420,7 +467,6 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 | MySQL      | mysql-connector | AUTO_INCREMENT | HASH 16개 | 최대 32개 |
 | SQL Server | mssql-jdbc      | IDENTITY       | -         | -         |
 | Tibero     | tibero-jdbc     | SEQUENCE       | HASH 16개 | -         |
-| DB2        | db2jcc          | SEQUENCE       | HASH 16개 | -         |
 
 ## 환경 변수 설정
 
@@ -452,7 +498,6 @@ chmod +x run_*.sh
 ./run_mysql_jdbc_test.sh
 ./run_sqlserver_jdbc_test.sh
 ./run_tibero_jdbc_test.sh
-./run_db2_jdbc_test.sh
 ```
 
 ## Graceful Shutdown
@@ -475,7 +520,7 @@ chmod +x run_*.sh
 ### JDBC 드라이버 찾을 수 없음
 
 - `./jre` 디렉터리 구조 확인
-- JAR 파일명 패턴 확인 (예: ojdbc\*.jar, postgresql-\*.jar, \*jcc\*.jar)
+- JAR 파일명 패턴 확인 (ojdbc\*.jar 등)
 
 ### 커넥션 풀 부족
 
@@ -506,6 +551,6 @@ MIT License
 
 ## Python JDBC Notes
 
-- Added DB2 support (db-type: `db2`, default port: `50000`, JDBC JAR: `./jre/db2/*jcc*.jar` e.g. `db2jcc4.jar`).
+- Added DB2 support (db-type: `db2`, default port: `50000`, JDBC JAR: `./jre/db2/jcc*.jar`).
 - New options: `--truncate`, `--idle-timeout`, `--keepalive-time`.
 - Defaults aligned with Java version: warmup `30s`, monitor interval `1.0s`.
