@@ -360,6 +360,7 @@ class PerformanceCounter:
             'realtime_tps': stats['realtime_tps'],
             'avg_tps': stats['avg_tps'],
             'latency_avg': round(latency_stats['avg'], 2),
+            'latency_p50': round(latency_stats['p50'], 2),
             'latency_p95': round(latency_stats['p95'], 2),
             'latency_p99': round(latency_stats['p99'], 2),
             'is_warmup': self.is_warmup_period()
@@ -2788,7 +2789,7 @@ class MonitorThread(threading.Thread):
                 f"ERR: {interval_stats['interval_errors']:,} | "
                 f"Avg TPS: {avg_tps_str} | "
                 f"RT TPS: {round(realtime_tps)} | "
-                f"Lat(p95/p99): {latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
+                f"Lat(p50/p95/p99): {latency_stats['p50']:.1f}/{latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
                 f"Pool: {pool_stats.get('pool_active', 0)}/{pool_stats.get('pool_total', 0)}"
             )
 

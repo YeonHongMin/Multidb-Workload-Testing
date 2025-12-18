@@ -74,7 +74,8 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test_user --password test_pass \
-    --thread-count 100 --test-duration 60
+    --thread-count 100 --test-duration 60 \
+    --truncate
 ```
 
 ```bash
@@ -356,7 +357,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 ## 모니터링 출력 예시
 
 ```
-12:34:56 - [Monitor] [RUNNING] TXN: 45,230 | INS: 45,230 | SEL: 45,230 | UPD: 0 | DEL: 0 | ERR: 0 | Avg TPS: 1508 | RT TPS: 1523 | Lat(p95/p99): 4.5/8.2ms | Pool: 95/100
+12:34:56 - [Monitor] [RUNNING] TXN: 45,230 | INS: 45,230 | SEL: 45,230 | UPD: 0 | DEL: 0 | ERR: 0 | Avg TPS: 1508 | RT TPS: 1523 | Lat(p50/p95/p99): 2.3/4.5/8.2ms | Pool: 95/100
 ```
 
 | 지표      | 설명                         |
@@ -369,7 +370,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 | ERR       | 총 에러 수                   |
 | Avg TPS   | Average TPS (rounded) |
 | RT TPS    | Realtime TPS (rounded) |
-| Lat       | Latency p95/p99 (ms) |
+| Lat       | Latency p50/p95/p99 (ms) |
 | Pool      | 커넥션 풀 상태 (사용중/전체) |
 
 ## 결과 파일 형식

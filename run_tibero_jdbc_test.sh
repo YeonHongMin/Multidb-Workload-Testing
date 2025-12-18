@@ -36,6 +36,7 @@ python multi_db_load_tester_jdbc.py \
     --test-duration ${TEST_DURATION} \
     --min-pool-size ${MIN_POOL_SIZE} \
     --max-pool-size ${MAX_POOL_SIZE} \
+    --truncate \
     --mode ${MODE} \
     --jre-dir ${JRE_DIR} \
     --log-level INFO
