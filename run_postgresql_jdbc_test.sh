@@ -39,6 +39,7 @@ python multi_db_load_tester_jdbc.py \
     --truncate \
     --mode ${MODE} \
     --jre-dir ${JRE_DIR} \
-    --log-level INFO
+    --log-level INFO \
+    --connection-timeout 5
 
 echo "Test completed. Check multi_db_load_test_jdbc.log for details."

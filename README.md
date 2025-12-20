@@ -1,4 +1,4 @@
-# Multi-Database Load Tester v2.2 (Python & JDBC Driver)
+# Multi-Database Load Tester v2.2.3 (Python & JDBC Driver)
 
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
@@ -18,7 +18,18 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티�
 - **Graceful Shutdown**: Ctrl+C 안전 종료
 - **커넥션 풀 모니터링**: 실시간 풀 상태 확인
 
-### v2.2 신규 기능: 향상된 커넥션 풀 관리
+### v2.2.3 버그 수정: DB 재기동 후 Hang 현상 해결
+
+- **문제**: DB 재기동/Failover 시 워커 스레드가 무한 대기(Hang) 상태에 빠지는 현상
+- **원인**: `acquire()` 함수에서 `pool.get(timeout=30)` 호출 시 풀이 비어있으면 30초간 블로킹
+- **해결책**:
+  1. `pool_timeout`을 최대 1초로 제한 (`min(timeout, 1)`)
+  2. 최대 3회 재시도 로직 추가 (총 최대 3초 대기)
+  3. 명시적 `queue.Empty` 예외 발생으로 상위 레벨에서 backoff 처리
+  4. `MAX_BACKOFF_MS`를 5000ms → 1000ms로 축소 (복구 시간 28% 단축)
+- **결과**: DB 복구 시 약 23초 내 자동 재연결 (기존 무한 대기 → 빠른 복구)
+
+### v2.2.2 신규 기능: 향상된 커넥션 풀 관리
 
 - **Connection Leak 감지**: 오래 사용 중인 커넥션 자동 감지 및 경고
 - **Pool Warm-up**: 초기화 시 min_size 커넥션 미리 생성
@@ -46,12 +57,14 @@ pip install -r requirements.txt
 
 ### 2. JDBC 드라이버 배치
 
-`./jre` 디렉터리에 각 데이터베이스의 JDBC 드라이버를 배치합니다:
+JDBC 드라이버는 `./jre/<db_type>/*.jar`에 배치합니다:
 
 ```
 ./jre/
+├── db2/
+│   └── db2jcc4.jar
 ├── oracle/
-│   └── ojdbc10.jar
+│   └── ojdbc11.jar
 ├── tibero/
 │   └── tibero7-jdbc.jar
 ├── postgresql/
@@ -122,6 +135,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test_user --password test_pass \
+    --truncate \
     --thread-count 100 --test-duration 60
 ```
 
@@ -146,12 +160,14 @@ python multi_db_load_tester_jdbc.py --version
 python multi_db_load_tester_jdbc.py --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test --password pass \
+    --truncate \
     --mode insert-only --thread-count 200
 
 # Mixed 모드 (실제 워크로드 시뮬레이션)
 python multi_db_load_tester_jdbc.py --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test --password pass \
+    --truncate \
     --mode mixed --thread-count 200
 ```
 
@@ -164,6 +180,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type postgresql \
     --host localhost --port 5432 --database testdb \
     --user test --password pass \
+    --truncate \
     --warmup 30 \
     --ramp-up 60 \
     --target-tps 5000 \
@@ -177,18 +194,20 @@ python multi_db_load_tester_jdbc.py \
     --db-type mysql \
     --host localhost --port 3306 --database testdb \
     --user root --password pass \
+    --truncate \
     --mode insert-only \
     --batch-size 100 \
     --thread-count 50
 ```
 
-#### 커넥션 풀 고급 설정 (v2.2 신규)
+#### 커넥션 풀 고급 설정 (v2.2.2 신규)
 
 ```bash
 python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test --password pass \
+    --truncate \
     --min-pool-size 50 \
     --max-pool-size 100 \
     --max-lifetime 1800 \
@@ -204,6 +223,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test --password pass \
+    --truncate \
     --output-format json \
     --output-file results/test_result.json
 
@@ -212,6 +232,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host localhost --port 1521 --sid XEPDB1 \
     --user test --password pass \
+    --truncate \
     --output-format csv \
     --output-file results/test_result.csv
 ```
@@ -225,6 +246,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type oracle \
     --host 192.168.0.100 --port 1521 --service-name ORCL \
     --user test_user --password pass \
+    --truncate \
     --thread-count 200 --test-duration 300
 ```
 
@@ -235,6 +257,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type postgresql \
     --host localhost --port 5432 --database testdb \
     --user test_user --password pass \
+    --truncate \
     --thread-count 200
 ```
 
@@ -245,6 +268,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type mysql \
     --host localhost --port 3306 --database testdb \
     --user root --password pass \
+    --truncate \
     --thread-count 100
 ```
 
@@ -257,6 +281,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type sqlserver \
     --host localhost --port 1433 --database testdb \
     --user sa --password pass \
+    --truncate \
     --thread-count 200
 ```
 
@@ -267,6 +292,7 @@ python multi_db_load_tester_jdbc.py \
     --db-type tibero \
     --host 192.168.0.140 --port 8629 --sid tibero \
     --user test_user --password pass \
+    --truncate \
     --thread-count 200
 ```
 
@@ -330,13 +356,21 @@ python multi_db_load_tester_jdbc.py \
 | `--min-pool-size` | 100    | 최소 풀 크기 (Warm-up 시 생성) |
 | `--max-pool-size` | 200    | 최대 풀 크기                   |
 
-### 커넥션 풀 고급 설정 (v2.2 신규)
+### 커넥션 풀 고급 설정 (v2.2.2 신규)
 
 | 옵션                         | 기본값 | 설명                               |
 | ---------------------------- | ------ | ---------------------------------- |
 | `--max-lifetime`             | 1800   | 커넥션 최대 수명 (초, 30분)        |
 | `--leak-detection-threshold` | 60     | Leak 감지 임계값 (초)              |
 | `--idle-check-interval`      | 30     | 유휴 커넥션 Health Check 주기 (초) |
+| `--idle-timeout`             | 30     | 유휴 커넥션 제거 시간 (초)         |
+| `--keepalive-time`           | 30     | 유휴 커넥션 검증 주기 (초)         |
+| `--connection-timeout`       | 30     | 커넥션 로그인 타임아웃 (초)        |
+
+**Timeout 설정 가이드**
+
+- `--connection-timeout`: DB 재기동/Failover 중 커넥션 획득이 오래 블록되는 것을 방지합니다. HA 환경은 5~30초 권장.
+- `--idle-timeout`/`--keepalive-time`: keepalive로 죽은 커넥션을 빠르게 감지하고 idle-timeout으로 정리합니다. `idle-timeout > keepalive-time` 권장.
 
 ### 기타
 
@@ -352,7 +386,7 @@ python multi_db_load_tester_jdbc.py \
 - Main log: `multi_db_load_test_jdbc.log` (INFO and below)
 - Error log: `multi_db_load_test_jdbc_error.log` (WARN/ERROR)
 
-## 커넥션 풀 관리 (v2.2 신규)
+## 커넥션 풀 관리 (v2.2.2 신규)
 
 ### Pool Warm-up
 
@@ -552,5 +586,5 @@ MIT License
 ## Python JDBC Notes
 
 - Added DB2 support (db-type: `db2`, default port: `50000`, JDBC JAR: `./jre/db2/jcc*.jar`).
-- New options: `--truncate`, `--idle-timeout`, `--keepalive-time`.
+- New options: `--truncate`, `--idle-timeout`, `--keepalive-time`, `--connection-timeout`.
 - Defaults aligned with Java version: warmup `30s`, monitor interval `1.0s`.
