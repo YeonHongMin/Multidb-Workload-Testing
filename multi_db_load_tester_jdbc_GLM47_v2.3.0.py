@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.2
+멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.3
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 
 특징:
