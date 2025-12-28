@@ -65,7 +65,7 @@ from abc import ABC, abstractmethod
 import queue
 
 # Keep version in one place for logging/CLI banners.
-VERSION = "2.2"
+VERSION = "2.3"
 
 # JDBC 드라이버 사용을 위한 라이브러리
 try:
@@ -799,42 +799,77 @@ class JDBCConnectionPool:
         self._start_health_check_thread()
 
     def _create_connection_internal(self) -> Optional[PooledConnection]:
-        """내부용 커넥션 생성"""
-        with self.lock:
-            if self.current_size >= self.max_size:
-                return None
-            self.current_size += 1
+        """
+        내부용 커넥션 생성 (재시도 로직 포함)
 
-        try:
-            # Properties 딕셔너리를 사용하여 연결 (타임아웃 등 설정 포함)
-            conn = jaydebeapi.connect(
-                self.driver_class,
-                self.jdbc_url,
-                self.connection_properties,
-                self.jar_file
-            )
-            conn.jconn.setAutoCommit(False)
-            
-            # Explicitly set network timeout if supported (JDBC 4.1+)
+        개선사항:
+        1. DB 재기동 등 일시적 연결 실패 시 최대 3회 재시도
+        2. Exponential Backoff 적용 (100ms → 200ms → 400ms, 최대 2초)
+        3. 상세 로깅으로 실패 원인 추적 용이
+        4. DB listener 과도 부하 방지를 위한 지수적 대기
+
+        Returns:
+            성공 시 PooledConnection 객체, 실패 시 None
+        """
+        max_creation_retries = 3  # 최대 재시도 횟수
+        creation_backoff_ms = 100  # 초기 백오프 시간 (밀리초)
+
+        for attempt in range(max_creation_retries):
+            # 커넥션 풀 용량 체크 (최대 크기 초과 시 생성 불가)
+            with self.lock:
+                if self.current_size >= self.max_size:
+                    return None
+                self.current_size += 1  # 생성 시도 전에 카운트 증가
+
             try:
-                timeout_ms = 5000 
-                if 'oracle.jdbc.ReadTimeout' in self.connection_properties:
-                     timeout_ms = int(self.connection_properties['oracle.jdbc.ReadTimeout'])
-                
-                if hasattr(conn.jconn, 'setNetworkTimeout'):
-                     conn.jconn.setNetworkTimeout(None, timeout_ms)
-            except Exception:
-                pass
+                # Properties 딕셔너리를 사용하여 연결 (타임아웃 등 설정 포함)
+                conn = jaydebeapi.connect(
+                    self.driver_class,
+                    self.jdbc_url,
+                    self.connection_properties,
+                    self.jar_file
+                )
+                conn.jconn.setAutoCommit(False)
 
-            with self.lock:
-                self.total_created += 1
-                
-            return PooledConnection(connection=conn)
-        except Exception as e:
-            with self.lock:
-                self.current_size -= 1
-            logger.error(f"Failed to create connection (URL: {self.jdbc_url}): {e}")
-            return None
+                # 네트워크 타임아웃 명시적 설정 (JDBC 4.1+ 지원 시)
+                try:
+                    timeout_ms = 5000  # 기본 5초 타임아웃
+                    if 'oracle.jdbc.ReadTimeout' in self.connection_properties:
+                         timeout_ms = int(self.connection_properties['oracle.jdbc.ReadTimeout'])
+
+                    if hasattr(conn.jconn, 'setNetworkTimeout'):
+                         conn.jconn.setNetworkTimeout(None, timeout_ms)
+                except Exception:
+                    pass
+
+                # 커넥션 생성 성공: 카운터 증가 및 PooledConnection 래핑 반환
+                with self.lock:
+                    self.total_created += 1
+
+                return PooledConnection(connection=conn)
+
+            except Exception as e:
+                # 생성 실패: 카운터 감소
+                with self.lock:
+                    self.current_size -= 1
+
+                # 마지막 시도가 아닌 경우: 재시도 수행
+                if attempt < max_creation_retries - 1:
+                    logger.warning(
+                        f"[Connection Creation] {attempt + 1}/{max_creation_retries} 시도 실패: {e}. "
+                        f"{creation_backoff_ms}ms 후 재시도..."
+                    )
+                    # 지수적 백오프: 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms(최대)
+                    time.sleep(creation_backoff_ms / 1000.0)
+                    creation_backoff_ms = min(creation_backoff_ms * 2, 2000)
+                else:
+                    # 최대 재시도 초과: 최종 에러 로그
+                    logger.error(
+                        f"[Connection Creation] {max_creation_retries}회 시도 후 실패 (URL: {self.jdbc_url}): {e}"
+                    )
+                return None
+
+        return None
 
     def _create_connection(self):
         """새 커넥션 생성 (하위 호환성 유지)"""
@@ -1031,54 +1066,69 @@ class JDBCConnectionPool:
             self.lock.release()
 
     def acquire(self, timeout: int = 30):
-        """커넥션 획득
+        """
+        커넥션 획득 (향상된 재시도 로직 포함)
+
+        개선사항:
+        1. DB 재기동 시 커넥션 풀 복구 로직 강화
+        2. Exponential Backoff 적용 (100ms → 200ms → 400ms → 800ms → 1600ms → 5000ms)
+        3. 큐가 비어있을 때만 새 커넥션 생성 (DB listener 부하 감소)
+        4. Max Lifetime 초과 시 자동 재생성
+        5. 상세 로깅으로 재시도 추적
+
+        Args:
+            timeout: 커넥션 획득 최대 대기 시간 (초)
 
         Returns:
-            연결된 커넥션 객체 (내부적으로 PooledConnection 추적)
+            연결된 커넥션 객체 (성공), None (실패)
         """
         retry_count = 0
-        max_retries = 3
+        max_retries = 3  # 최대 재시도 횟수
+        backoff_ms = 100  # 초기 백오프 시간 (밀리초)
         thread_name = threading.current_thread().name
 
         while retry_count < max_retries:
             try:
-                # If we have space to create new connections and queue is empty, 
-                # don't wait long on get(). Fail fast to trigger creation.
-                # If we are full, we must wait for a connection to be returned.
-                
-                # Check if we should try 'get' with long timeout or short
+                # 큐 대기 시간 결정:
+                # - 큐가 비어있고 풀에 여유가 있으면: 빠르게 생성 시도 (0.1초)
+                # - 그 외: 전체 타임아웃까지 대기
                 wait_time = timeout
                 if self.current_size < self.max_size and self.pool.empty():
                      wait_time = 0.1 # Fail fast to trigger 'except Empty' -> creation
 
+                # 큐에서 커넥션 획득 시도
                 pooled_conn = self.pool.get(timeout=wait_time)
 
-                # Max Lifetime 초과 시 재생성
+                # Max Lifetime 초과 시 재생성 (오래된 커넥션 자동 교체)
                 if self._is_connection_expired(pooled_conn):
                     self._close_pooled_connection(pooled_conn)
                     with self.lock:
                         self.total_recycled += 1
                     pooled_conn = self._create_connection_internal()
-                    
-                    if pooled_conn is None: 
-                        # Creation failed, so we treat this as a retry iteration
+
+                    if pooled_conn is None:
+                        # 새 커넥션 생성 실패: 재시도 카운트 증가 및 백오프 적용
                         retry_count += 1
-                        time.sleep(1) # Backoff
+                        time.sleep(backoff_ms / 1000.0)
+                        backoff_ms = min(backoff_ms * 2, 5000)  # 지수적 백오프
                         continue
 
+                # 커넥션 유효성 검사 (Closed 검증)
                 if self._validate_connection(pooled_conn):
                     pooled_conn.mark_acquired(thread_name)
 
-                    # Leak 감지용 추적
+                    # Leak 감지용 추적: 현재 사용 중인 커넥션 등록
                     conn_id = id(pooled_conn.connection)
                     with self.active_connections_lock:
                         self.active_connections[conn_id] = pooled_conn
 
+                    # 활성 커넥션 카운트 증가
                     with self.lock:
                         self.active_count += 1
 
                     return pooled_conn.connection
                 else:
+                    # 유효하지 않은 커넥션: 폐기
                     self._close_pooled_connection(pooled_conn)
                     # Validation failed, try to replace it immediately if possible
                     # But don't recursively create if we are just consuming a bad one?
@@ -1086,33 +1136,36 @@ class JDBCConnectionPool:
                     pass
 
             except queue.Empty:
+                # 큐가 비어있음: 새 커넥션 생성 시도
+                can_create = False
                 with self.lock:
-                    if self.current_size < self.max_size:
-                        pooled_conn = self._create_connection_internal()
-                        if pooled_conn:
-                            pooled_conn.mark_acquired(thread_name)
-                            conn_id = id(pooled_conn.connection)
-                            with self.active_connections_lock:
-                                self.active_connections[conn_id] = pooled_conn
+                    can_create = self.current_size < self.max_size
+
+                if can_create:
+                    # 새 커넥션 생성 시도 (내부에서 재시도 로직 실행됨)
+                    pooled_conn = self._create_connection_internal()
+                    if pooled_conn:
+                        # 커넥션 생성 성공: 반환
+                        pooled_conn.mark_acquired(thread_name)
+                        conn_id = id(pooled_conn.connection)
+                        with self.active_connections_lock:
+                            self.active_connections[conn_id] = pooled_conn
+                        with self.lock:
                             self.active_count += 1
-                            return pooled_conn.connection
+                        return pooled_conn.connection
+                    # 커넥션 생성 실패: 로그 기록
+                    logger.warning(
+                        f"[acquire] 커넥션 생성 실패 "
+                        f"(시도 {retry_count + 1}/{max_retries})"
+                    )
 
-                # If creation failed or queue empty with size=max, wait a bit before retry
-                # to avoid hammering the DB listener which causes ORA-12528
-                time.sleep(1)
-
-                # Self-healing: if queue is empty but tracked size suggests available tracks, fix it.
-                # This fixes "phantom connection" leaks preventing new creation.
-                with self.lock:
-                    q_size = self.pool.qsize()
-                    tracked_idle = max(0, self.current_size - self.active_count)
-                    if tracked_idle > q_size + 2: # Tolerance
-                         logger.warning(f"Pool inconsistency detected (Tracked Idle: {tracked_idle}, Queue: {q_size}). Adjusting current_size.")
-                         self.current_size = self.active_count + q_size
-
+                # Backoff 후 재시도 (DB listener 과부하 방지)
+                if retry_count < max_retries - 1:
+                    time.sleep(backoff_ms / 1000.0)
+                    backoff_ms = min(backoff_ms * 2, 5000)  # 지수적 백오프
                 retry_count += 1
 
-        # 최종 시도
+        # 최대 재시도 후에도 실패: 최종 시도
         try:
             pooled_conn = self.pool.get(timeout=timeout)
             if pooled_conn:
@@ -1124,8 +1177,11 @@ class JDBCConnectionPool:
                     self.active_count += 1
                 return pooled_conn.connection
         except queue.Empty:
-            pass
-            
+            logger.error(
+                f"[acquire] {max_retries}회 재시도 후 커넥션 획득 실패 "
+                f"(큐 비어있음)"
+            )
+
         return None
 
     def release(self, conn):
@@ -2748,11 +2804,23 @@ class LoadTestWorker:
                     pass
 
     def run(self) -> int:
-        """워커 실행"""
+        """
+        워커 실행 (향상된 재연결 로직 포함)
+
+        개선사항:
+        1. DB 재기동 시 자동 재연결 로직 강화
+        2. Exponential Backoff 적용 (100ms → 200ms → 400ms → 800ms → 5000ms)
+        3. 연속 실패 시 백오프 적용으로 DB 과부하 방지
+        4. 커넥션 유효성 검사로 손상된 커넥션 자동 교체
+        5. 상세 로깅으로 문제 추적 용이
+
+        Returns:
+            완료된 트랜잭션 수
+        """
         logger.info(f"[{self.thread_name}] Starting (mode: {self.mode})")
 
         connection = None
-        consecutive_errors = 0
+        consecutive_errors = 0  # 연속 에러 카운트 (백오프 트리거용)
         max_id = self.max_id_cache
 
         while datetime.now() < self.end_time:
@@ -2760,28 +2828,53 @@ class LoadTestWorker:
             if shutdown_handler and shutdown_handler.is_shutdown_requested():
                 break
 
-            # Rate limiting
+            # Rate limiting (목표 TPS 제어)
             if self.rate_limiter and not self.rate_limiter.acquire(timeout=0.5):
                 continue
 
             try:
+                # 커넥션 없는 경우: 새 커넥션 획득 시도
                 if connection is None:
                     now = time.time()
-                    if now - self.last_error_log_time > 5: # Log every 5 seconds
-                         logger.debug(f"[{self.thread_name}] Waiting for connection... (Pool: {self.db_adapter.get_pool_stats().get('pool_total', '?')})")
+                    if now - self.last_error_log_time > 5: # 5초마다 로그
+                         logger.warning(
+                             f"[{self.thread_name}] 커넥션 대기 중... "
+                             f"(Pool: {self.db_adapter.get_pool_stats().get('pool_total', '?')})"
+                         )
                          self.last_error_log_time = now
+
+                    # 유효한 커넥션 획득 시도 (내부 재시도 로직 포함)
                     connection = self._get_valid_connection()
-                    consecutive_errors = 0
+
+                    if connection is not None:
+                        # 커넥션 획득 성공: 에러 카운터 및 백오프 리셋
+                        consecutive_errors = 0
+                        self.reset_backoff()
+                    else:
+                        # 커넥션 획득 실패: 연속 에러 카운트 증가
+                        consecutive_errors += 1
+                        if consecutive_errors >= 2:
+                            # 연속 2회 이상 실패 시 백오프 적용
+                            # DB 재기동 등 일시적 연결 불가 시 과부하 방지
+                            logger.warning(
+                                f"[{self.thread_name}] 연속 {consecutive_errors}회 실패. "
+                                f"{self.current_backoff_ms}ms 백오프 후 재시도..."
+                            )
+                            time.sleep(self.current_backoff_ms / 1000.0)
+                            self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
+                        else:
+                            # 첫 실패는 1초 대기 후 재시도
+                            time.sleep(1)
+                        continue
                 else:
+                    # 커넥션이 있는 경우: 유효성 검사
                     if not self._is_connection_valid(connection):
+                        # 손상된 커넥션: 폐기 및 새 커넥션 획득
                         self.db_adapter.discard_connection(connection)
                         connection = self._get_valid_connection()
                         perf_counter.increment_connection_recreate()
 
-                if connection is None:
-                    time.sleep(1)
-                    continue
-
+                # SELECT/UPDATE/DELETE/MIXED 모드: 기존 데이터 필요
                 needs_data = self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
                                            WorkMode.DELETE_ONLY, WorkMode.MIXED]
                 if needs_data and (max_id == 0 or self.transaction_count % 100 == 0):
@@ -2792,7 +2885,7 @@ class LoadTestWorker:
                         time.sleep(1)
                         continue
 
-                # 모드별 실행
+                # 모드별 DB 작업 실행
                 if self.mode == WorkMode.INSERT_ONLY:
                     success = self.execute_insert(connection)
                 elif self.mode == WorkMode.SELECT_ONLY:
@@ -2806,12 +2899,18 @@ class LoadTestWorker:
                 else:
                     success = self.execute_full(connection)
 
+                # 작업 실패 처리
                 if not success:
                     consecutive_errors += 1
                     if consecutive_errors >= 2:
+                        # 연속 2회 이상 실패 시 커넥션 폐기 및 재시도
                         self.db_adapter.discard_connection(connection)
                         connection = None
                         perf_counter.increment_connection_recreate()
+                        logger.warning(
+                            f"[{self.thread_name}] 작업 실패. "
+                            f"{self.current_backoff_ms}ms 백오프 후 재시도..."
+                        )
                         time.sleep(self.current_backoff_ms / 1000.0)
                         self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
                 else:
