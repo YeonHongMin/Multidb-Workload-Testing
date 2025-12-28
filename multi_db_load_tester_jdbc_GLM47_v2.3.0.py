@@ -125,7 +125,7 @@ class WorkMode:
 # Graceful Shutdown Handler
 # ============================================================================
 class GracefulShutdown:
-    """Graceful Shutdown 핸들러"""
+    """우아한 종료(Graceful Shutdown) 핸들러"""
 
     def __init__(self):
         self.shutdown_requested = False
@@ -139,7 +139,7 @@ class GracefulShutdown:
         with self.lock:
             if not self.shutdown_requested:
                 self.shutdown_requested = True
-                logger.info("\n[Shutdown] Graceful shutdown requested. Finishing current transactions...")
+                logger.info("\n[Shutdown] 우아한 종료 요청됨. 현재 트랜잭션 완료 중...")
 
     def is_shutdown_requested(self) -> bool:
         with self.lock:
