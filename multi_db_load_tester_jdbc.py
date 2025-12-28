@@ -20,23 +20,23 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 - **점진적 부하 증가 (Ramp-up)**
 - **커넥션 풀 상태 모니터링**
 
-Usage Examples:
-  # Full mode (INSERT -> COMMIT -> SELECT)
+사용 예시:
+  # Full 모드 (INSERT -> COMMIT -> SELECT)
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --mode full
 
-  # Insert-only with batch size
+  # Insert-only 모드 (배치 크기 지정)
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --mode insert-only --batch-size 100
 
-  # With warmup, ramp-up, and rate limiting
+  # 워밍업, Ramp-up, TPS 제한 적용
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --warmup 30 --ramp-up 60 --target-tps 1000
 
-  # Export results to CSV/JSON
+  # 결과 CSV/JSON 내보내기
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --output-format csv --output-file results.csv
@@ -51,20 +51,19 @@ import random
 import string
 import os
 import glob
-import platform
 import signal
 import json
 import csv
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 
 from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import queue
 
-# Keep version in one place for logging/CLI banners.
+# 버전 정보 (로그 및 CLI 배너에 사용)
 VERSION = "2.3"
 
 # JDBC 드라이버 사용을 위한 라이브러리
@@ -136,7 +135,7 @@ class WorkMode:
 
 
 # ============================================================================
-# Graceful Shutdown Handler
+# 우아한 종료 핸들러
 # ============================================================================
 class GracefulShutdown:
     """우아한 종료(Graceful Shutdown) 핸들러"""
@@ -164,7 +163,7 @@ class GracefulShutdown:
         with self.lock:
             if not self.shutdown_requested:
                 self.shutdown_requested = True
-                logger.info("\n[Shutdown] 우아한 종료 요청됨. 현재 트랜잭션 완료 중...")
+                logger.info("\n[Shutdown] Graceful shutdown requested. Completing current transactions...")
 
     def is_shutdown_requested(self) -> bool:
         """종료 요청 여부 확인
@@ -216,7 +215,7 @@ class PerformanceCounter:
         self.post_warmup_transactions = 0
         self.post_warmup_start_time: Optional[float] = None
 
-        # Sub-second 측정
+        # 초 미만 단위 측정
         self.sub_second_window_ms = sub_second_window_ms
         self.sub_second_window_sec = sub_second_window_ms / 1000.0
         self.recent_transactions: deque = deque()
@@ -331,7 +330,7 @@ class PerformanceCounter:
 
         return float(count)
 
-    def get_windowed_tps(self, window_ms: int = None) -> float:
+    def get_windowed_tps(self, window_ms: Optional[int] = None) -> float:
         """지정된 윈도우 내 TPS (지정된 시간 범위의 평균 처리량)
 
         Args:
@@ -415,7 +414,7 @@ class PerformanceCounter:
                 'interval_tps': round(interval_tps, 2)
             }
 
-    def record_time_series(self, pool_stats: Dict[str, int] = None):
+    def record_time_series(self, pool_stats: Optional[Dict[str, Union[int, str]]] = None):
         """시계열 데이터 기록
 
         주기적으로 호출되어 현재 성능 지표를 시계열 리스트에 저장
@@ -492,7 +491,7 @@ perf_counter: Optional[PerformanceCounter] = None
 
 
 # ============================================================================
-# Rate Limiter (Token Bucket Algorithm)
+# Rate Limiter (토큰 버킷 알고리즘)
 # ============================================================================
 class RateLimiter:
     """Token Bucket 기반 Rate Limiter (속도 제한)"""
@@ -668,51 +667,7 @@ JDBC_DRIVERS = {
 }
 
 
-def get_jvm_path() -> str:
-    """크로스 플랫폼 JVM 경로 찾기
-
-    Windows, macOS, Linux 환경에서 JVM 라이브러리 경로를 자동 탐지합니다.
-    JAVA_HOME 환경 변수가 설정된 경우 우선 사용합니다.
-
-    Returns:
-        JVM 라이브러리 경로 (jvm.dll, libjvm.dylib, libjvm.so)
-
-    Raises:
-        RuntimeError: JVM을 찾을 수 없는 경우
-    """
-    system = platform.system().lower()
-    java_home = os.environ.get('JAVA_HOME', '')
-
-    if system == 'windows':
-        possible_paths = [
-            r"C:\jdk25\bin\server\jvm.dll",
-            os.path.join(java_home, 'bin', 'server', 'jvm.dll') if java_home else '',
-            os.path.join(java_home, 'jre', 'bin', 'server', 'jvm.dll') if java_home else '',
-        ]
-    elif system == 'darwin':
-        possible_paths = [
-            '/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/lib/server/libjvm.dylib',
-            '/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home/lib/server/libjvm.dylib',
-            os.path.join(java_home, 'lib', 'server', 'libjvm.dylib') if java_home else '',
-        ]
-    else:
-        possible_paths = [
-            '/usr/lib/jvm/java-21-openjdk/lib/server/libjvm.so',
-            '/usr/lib/jvm/java-17-openjdk/lib/server/libjvm.so',
-            os.path.join(java_home, 'lib', 'server', 'libjvm.so') if java_home else '',
-        ]
-
-    for path in possible_paths:
-        if path and os.path.exists(path):
-            return path
-
-    try:
-        return jpype.getDefaultJVMPath()
-    except Exception:
-        raise RuntimeError("JVM path not found. Set JAVA_HOME or install Java.")
-
-
-def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
+def initialize_jvm(jre_dir: str = './jre'):
     """JVM 초기화 및 JDBC 드라이버 로드
 
     지정된 디렉터리의 모든 JAR 파일을 클래스패스에 추가하고 JVM을 시작합니다.
@@ -720,12 +675,11 @@ def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
 
     Args:
         jre_dir: JDBC 드라이버 JAR 파일이 있는 디렉터리 경로
-        extra_args: 추가 JVM 인자 리스트 (옵션)
     """
     if jpype.isJVMStarted():
         return
 
-    jvm_path = get_jvm_path()
+    jvm_path = jpype.getDefaultJVMPath()
     logger.info(f"Initializing JVM using: {jvm_path}")
 
     jars = []
@@ -744,9 +698,6 @@ def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
         "-Xmx2048m",
         "-XX:+UseSerialGC"
     ]
-    
-    if extra_args:
-        jvm_args.extend(extra_args)
 
     try:
         jpype.startJVM(jvm_path, *jvm_args)
@@ -810,7 +761,7 @@ class PooledConnection:
     acquired_by: Optional[str] = None
     last_used_at: float = field(default_factory=time.time)
 
-    def mark_acquired(self, thread_name: str = None):
+    def mark_acquired(self, thread_name: Optional[str] = None):
         """커넥션 획득 시 호출
 
         Leak 감지를 위해 획득 시간 및 스레드 정보를 기록합니다.
@@ -884,7 +835,7 @@ class JDBCConnectionPool:
                  idle_check_interval_seconds: int = 30,
                  idle_timeout_seconds: int = 30,
                  keepalive_time_seconds: int = 30,
-                 connection_properties: Dict[str, str] = None):
+                 connection_properties: Optional[Dict[str, str]] = None):
         """
         Args:
             jdbc_url: JDBC 연결 URL
@@ -929,7 +880,7 @@ class JDBCConnectionPool:
         self.active_count = 0
         self.lock = threading.Lock()
 
-        # Leak 감지용: 현재 사용 중인 커넥션 추적
+        # Leak 감지용: 현재 사용 중인 커넥션 추적 (conn_id -> PooledConnection)
         self.active_connections: Dict[int, PooledConnection] = {}
         self.active_connections_lock = threading.Lock()
 
@@ -938,7 +889,7 @@ class JDBCConnectionPool:
         self.total_recycled = 0  # max_lifetime 초과로 재생성된 커넥션 수
         self.total_leaked_warnings = 0
 
-        # Health Check 스레드
+        # Health Check 스레드 관리
         self._health_check_thread: Optional[threading.Thread] = None
         self._health_check_running = False
 
@@ -952,7 +903,7 @@ class JDBCConnectionPool:
         logger.info(f"  - Keepalive Time: {self.keepalive_time_seconds}s")
         logger.info(f"JDBC URL: {jdbc_url}")
 
-        # Pool Warm-up: min_size만큼 커넥션 미리 생성
+        # 풀 웜업: min_size만큼 커넥션 미리 생성
         self._warmup_pool()
 
     def _warmup_pool(self):
@@ -973,7 +924,7 @@ class JDBCConnectionPool:
                 logger.warning(f"[Pool Warm-up] Failed to create connection {i+1}: {e}")
         logger.info(f"[Pool Warm-up] Completed. Created {created}/{self.min_size} connections")
 
-        # Health Check 스레드 시작
+        # Health Check 스레드 시작 (유휴 커넥션 검사 및 Leak 감지)
         self._start_health_check_thread()
 
     def _create_connection_internal(self) -> Optional[PooledConnection]:
@@ -1000,7 +951,7 @@ class JDBCConnectionPool:
                 self.current_size += 1  # 생성 시도 전에 카운트 증가
 
             try:
-                # Properties 딕셔너리를 사용하여 연결 (타임아웃 등 설정 포함)
+                # 커넥션 생성 (Properties에 타임아웃 등 설정 포함)
                 conn = jaydebeapi.connect(
                     self.driver_class,
                     self.jdbc_url,
@@ -1034,8 +985,8 @@ class JDBCConnectionPool:
                 # 마지막 시도가 아닌 경우: 재시도 수행
                 if attempt < max_creation_retries - 1:
                     logger.warning(
-                        f"[Connection Creation] {attempt + 1}/{max_creation_retries} 시도 실패: {e}. "
-                        f"{creation_backoff_ms}ms 후 재시도..."
+                        f"[Connection Creation] Attempt {attempt + 1}/{max_creation_retries} failed: {e}. "
+                        f"Retrying in {creation_backoff_ms}ms..."
                     )
                     # 지수적 백오프: 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms(최대)
                     time.sleep(creation_backoff_ms / 1000.0)
@@ -1043,7 +994,7 @@ class JDBCConnectionPool:
                 else:
                     # 최대 재시도 초과: 최종 에러 로그
                     logger.error(
-                        f"[Connection Creation] {max_creation_retries}회 시도 후 실패 (URL: {self.jdbc_url}): {e}"
+                        f"[Connection Creation] Failed after {max_creation_retries} attempts (URL: {self.jdbc_url}): {e}"
                     )
                 return None
 
@@ -1077,7 +1028,7 @@ class JDBCConnectionPool:
         try:
             if conn is None:
                 return False
-            # PooledConnection인 경우 내부 connection 추출
+            # PooledConnection 래퍼인 경우 내부 connection 추출
             actual_conn = conn.connection if isinstance(conn, PooledConnection) else conn
             jconn = actual_conn.jconn
             if jconn.isClosed():
@@ -1142,80 +1093,107 @@ class JDBCConnectionPool:
         3. Keepalive 시간 초과 커넥션 유효성 검사
         4. 무효한 커넥션 제거 및 min_size 유지를 위한 새 커넥션 생성
         """
-        checked = 0
-        removed = 0
-        recycled = 0
+        # 검사 통계 카운터 초기화
+        checked = 0   # 검사한 커넥션 수
+        removed = 0   # 제거된 커넥션 수
+        recycled = 0  # 재생성된 커넥션 수
 
+        # 유효한 커넥션을 임시 저장할 리스트
         valid_connections = []
 
         try:
+            # 풀에서 모든 커넥션을 꺼내서 검사
             while True:
                 try:
+                    # 큐에서 커넥션을 논블로킹으로 꺼냄
                     pooled_conn = self.pool.get_nowait()
                 except queue.Empty:
+                    # 큐가 비었으면 검사 루프 종료
                     break
 
                 checked += 1
 
+                # [검사 1] Max Lifetime 초과 여부 확인
                 if self._is_connection_expired(pooled_conn):
+                    # 만료된 커넥션은 닫고 새로 생성
                     self._close_pooled_connection(pooled_conn)
                     recycled += 1
                     with self.lock:
                         self.total_recycled += 1
+                    # 새 커넥션 생성하여 유효 목록에 추가
                     new_conn = self._create_connection_internal()
                     if new_conn:
                         valid_connections.append(new_conn)
                     continue
 
+                # 유휴 시간 계산
                 idle_seconds = pooled_conn.get_idle_seconds()
 
+                # [검사 2] Idle Timeout 초과 여부 확인
                 if idle_seconds is not None and self.idle_timeout_seconds > 0:
                     with self.lock:
+                        # min_size 이상일 때만 제거 가능
                         can_drop = self.current_size > self.min_size
                     if can_drop and idle_seconds > self.idle_timeout_seconds:
+                        # 오래 유휴 상태인 커넥션 제거 (풀 축소)
                         self._close_pooled_connection(pooled_conn)
                         removed += 1
                         continue
 
+                # [검사 3] Keepalive 시간 초과 시 유효성 검사
                 keepalive_checked = False
                 if idle_seconds is not None and self.keepalive_time_seconds > 0:
                     if idle_seconds > self.keepalive_time_seconds:
+                        # keepalive 시간 초과 - 유효성 검사 수행
                         keepalive_checked = True
                         if not self._validate_connection(pooled_conn):
+                            # 유효하지 않은 커넥션은 닫고 새로 생성
                             self._close_pooled_connection(pooled_conn)
                             removed += 1
                             new_conn = self._create_connection_internal()
                             if new_conn:
                                 valid_connections.append(new_conn)
                             continue
+                        # 유효성 검사 통과 시 마지막 사용 시간 갱신
                         pooled_conn.last_used_at = time.time()
 
+                # [검사 4] 최종 유효성 판정
                 if keepalive_checked or self._validate_connection(pooled_conn):
+                    # 유효한 커넥션은 보존
                     valid_connections.append(pooled_conn)
                 else:
+                    # 무효한 커넥션은 제거
                     self._close_pooled_connection(pooled_conn)
                     removed += 1
 
         finally:
+            # 유효한 커넥션들을 다시 풀에 반환
             for conn in valid_connections:
                 try:
                     self.pool.put_nowait(conn)
                 except queue.Full:
+                    # 풀이 가득 차면 커넥션 닫기
                     self._close_pooled_connection(conn)
 
+        # min_size 유지: 부족한 커넥션 보충
         while True:
             with self.lock:
                 if self.current_size >= self.min_size:
+                    # 최소 크기 충족 시 종료
                     break
+            # 새 커넥션 생성
             new_conn = self._create_connection_internal()
             if not new_conn:
+                # 생성 실패 시 종료
                 break
             try:
                 self.pool.put_nowait(new_conn)
             except queue.Full:
+                # 풀이 가득 차면 커넥션 닫고 종료
                 self._close_pooled_connection(new_conn)
                 break
 
+        # 변경사항이 있을 경우 로그 출력
         if removed > 0 or recycled > 0:
             logger.info(f"[Health Check] Checked: {checked}, Removed: {removed}, Recycled: {recycled}")
 
@@ -1225,11 +1203,15 @@ class JDBCConnectionPool:
         획득된 상태로 임계 시간을 초과한 커넥션을 탐지하여 경고 로그를 출력합니다.
         Leak된 커넥션은 자동으로 회수되지 않으며, 경고만 발생시킵니다.
         """
+        # Leak 의심 커넥션 목록
         leaked_connections = []
 
+        # 활성 커넥션들을 순회하며 Leak 여부 확인
         with self.active_connections_lock:
             for conn_id, pooled_conn in self.active_connections.items():
+                # 커넥션이 획득된 후 경과 시간 계산
                 duration = pooled_conn.get_acquired_duration_seconds()
+                # 임계 시간 초과 시 Leak으로 판정
                 if duration and duration > self.leak_detection_threshold_seconds:
                     leaked_connections.append({
                         'conn_id': conn_id,
@@ -1237,6 +1219,7 @@ class JDBCConnectionPool:
                         'thread': pooled_conn.acquired_by
                     })
 
+        # Leak 감지된 커넥션들에 대해 경고 로그 출력
         for leak in leaked_connections:
             self.total_leaked_warnings += 1
             logger.warning(
@@ -1252,14 +1235,17 @@ class JDBCConnectionPool:
             pooled_conn: 종료할 PooledConnection
         """
         try:
+            # 커넥션이 존재하면 닫기
             if pooled_conn and pooled_conn.connection:
                 pooled_conn.connection.close()
         except:
+            # 닫기 실패 시 무시 (이미 닫혔거나 오류 상태)
             pass
+        # 풀 크기 감소 (음수 방지)
         with self.lock:
             self.current_size = max(0, self.current_size - 1)
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
         """풀 상태 조회 (Non-blocking)
 
         모니터링 스레드가 락 대기로 멈추지 않도록 타임아웃을 적용합니다.
@@ -1267,21 +1253,21 @@ class JDBCConnectionPool:
         Returns:
             pool_total, pool_active, pool_idle 등을 포함한 딕셔너리
         """
-        # Monitor thread shouldn't hang on lock
+        # 락 획득 시도 (0.1초 타임아웃) - 모니터링 스레드가 멈추지 않도록 함
         if not self.lock.acquire(timeout=0.1):
-             # If cannot acquire lock, return estimated or cached values (or just zeros/current state without lock)
-             # Accessing without lock is unsafe but better than hanging monitor
-             return {
+            # 락 획득 실패 시 현재 값을 그대로 반환 (락 없이 접근은 안전하지 않지만 멈추는 것보다 나음)
+            return {
                 'pool_total': self.current_size,
                 'pool_active': self.active_count,
                 'pool_idle': max(0, self.current_size - self.active_count),
                 'pool_total_created': self.total_created,
                 'pool_recycled': self.total_recycled,
                 'pool_leak_warnings': self.total_leaked_warnings,
-                'status': 'locked'
-             }
-        
+                'status': 'locked'  # 락 획득 실패 상태 표시
+            }
+
         try:
+            # 락 획득 성공 시 정확한 풀 상태 반환
             return {
                 'pool_total': self.current_size,
                 'pool_active': self.active_count,
@@ -1291,6 +1277,7 @@ class JDBCConnectionPool:
                 'pool_leak_warnings': self.total_leaked_warnings
             }
         finally:
+            # 락 해제 (반드시 실행)
             self.lock.release()
 
     def acquire(self, timeout: int = 30):
@@ -1322,12 +1309,12 @@ class JDBCConnectionPool:
                 # - 그 외: 전체 타임아웃까지 대기
                 wait_time = timeout
                 if self.current_size < self.max_size and self.pool.empty():
-                     wait_time = 0.1 # Fail fast to trigger 'except Empty' -> creation
+                     wait_time = 0.1  # 빠른 실패로 'except Empty' 분기에서 새 커넥션 생성
 
                 # 큐에서 커넥션 획득 시도
                 pooled_conn = self.pool.get(timeout=wait_time)
 
-                # Max Lifetime 초과 시 재생성 (오래된 커넥션 자동 교체)
+                # 최대 수명 초과 시 재생성 (오래된 커넥션 자동 교체)
                 if self._is_connection_expired(pooled_conn):
                     self._close_pooled_connection(pooled_conn)
                     with self.lock:
@@ -1358,9 +1345,7 @@ class JDBCConnectionPool:
                 else:
                     # 유효하지 않은 커넥션: 폐기
                     self._close_pooled_connection(pooled_conn)
-                    # Validation failed, try to replace it immediately if possible
-                    # But don't recursively create if we are just consuming a bad one?
-                    # We should probably let the loop handle it
+                    # 유효성 검사 실패 시 루프에서 재시도하도록 함
                     pass
 
             except queue.Empty:
@@ -1383,11 +1368,11 @@ class JDBCConnectionPool:
                         return pooled_conn.connection
                     # 커넥션 생성 실패: 로그 기록
                     logger.warning(
-                        f"[acquire] 커넥션 생성 실패 "
-                        f"(시도 {retry_count + 1}/{max_retries})"
+                        f"[acquire] Connection creation failed "
+                        f"(attempt {retry_count + 1}/{max_retries})"
                     )
 
-                # Backoff 후 재시도 (DB listener 과부하 방지)
+                # 백오프 후 재시도 (DB 리스너 과부하 방지)
                 if retry_count < max_retries - 1:
                     time.sleep(backoff_ms / 1000.0)
                     backoff_ms = min(backoff_ms * 2, 5000)  # 지수적 백오프
@@ -1395,19 +1380,24 @@ class JDBCConnectionPool:
 
         # 최대 재시도 후에도 실패: 최종 시도
         try:
+            # 풀에서 커넥션 획득 시도 (timeout 시간 동안 대기)
             pooled_conn = self.pool.get(timeout=timeout)
             if pooled_conn:
+                # 커넥션 획득 성공: 획득 상태로 표시
                 pooled_conn.mark_acquired(thread_name)
                 conn_id = id(pooled_conn.connection)
+                # 활성 커넥션 목록에 추가
                 with self.active_connections_lock:
                     self.active_connections[conn_id] = pooled_conn
+                # 활성 커넥션 수 증가
                 with self.lock:
                     self.active_count += 1
                 return pooled_conn.connection
         except queue.Empty:
+            # 풀이 비어있어 커넥션 획득 실패
             logger.error(
-                f"[acquire] {max_retries}회 재시도 후 커넥션 획득 실패 "
-                f"(큐 비어있음)"
+                f"[acquire] Failed to acquire connection after {max_retries} retries "
+                f"(queue empty)"
             )
 
         return None
@@ -1435,31 +1425,39 @@ class JDBCConnectionPool:
             self.active_count = max(0, self.active_count - 1)
 
         if pooled_conn is None:
-            # PooledConnection을 찾지 못한 경우 (이전 버전 호환)
+            # PooledConnection을 찾지 못한 경우 (하위 호환성 처리)
             pooled_conn = PooledConnection(connection=conn)
 
         pooled_conn.mark_released()
 
         try:
-            # Max Lifetime 초과 검사
+            # 최대 수명 초과 검사
             if self._is_connection_expired(pooled_conn):
+                # 수명 초과된 커넥션 종료
                 self._close_pooled_connection(pooled_conn)
+                # 재활용 카운트 증가
                 with self.lock:
                     self.total_recycled += 1
                 # 새 커넥션 생성하여 풀에 추가
                 new_conn = self._create_connection_internal()
                 if new_conn:
+                    # 새 커넥션 생성 성공 시 풀에 즉시 추가
                     self.pool.put_nowait(new_conn)
                 return
 
+            # 커넥션 유효성 검사
             if self._validate_connection(pooled_conn):
+                # 풀 크기가 최대 크기 미만인 경우에만 반환
                 if self.pool.qsize() < self.max_size:
+                    # 유효한 커넥션을 풀에 반환
                     self.pool.put_nowait(pooled_conn)
                     return
 
+            # 유효성 검사 실패 시 커넥션 종료
             self._close_pooled_connection(pooled_conn)
 
         except queue.Full:
+            # 풀이 가득 찬 경우 커넥션 종료
             self._close_pooled_connection(pooled_conn)
 
     def discard(self, conn):
@@ -1498,7 +1496,7 @@ class JDBCConnectionPool:
         """
         logger.info("Closing all connections in pool...")
 
-        # Health Check 스레드 중지
+        # Health Check 스레드 중지 신호
         self._health_check_running = False
         if self._health_check_thread and self._health_check_thread.is_alive():
             self._health_check_thread.join(timeout=5)
@@ -1563,7 +1561,7 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
         """커넥션 풀 상태 조회"""
         pass
 
@@ -1627,6 +1625,11 @@ class DatabaseAdapter(ABC):
         """테스트 스키마 생성"""
         pass
 
+    @abstractmethod
+    def truncate_table(self, connection):
+        """테이블 데이터 삭제 (TRUNCATE)"""
+        pass
+
 
 # ============================================================================
 # Oracle JDBC 어댑터
@@ -1647,10 +1650,11 @@ class OracleJDBCAdapter(DatabaseAdapter):
         Raises:
             RuntimeError: Oracle JDBC 드라이버를 찾을 수 없는 경우
         """
-        self.pool = None
-        self.jar_file = find_jdbc_jar('oracle', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('oracle', jre_dir)
+        if not jar_file:
             raise RuntimeError("Oracle JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         if config.service_name:
@@ -1667,7 +1671,7 @@ class OracleJDBCAdapter(DatabaseAdapter):
                 sid=sid
             )
 
-        # Oracle Connection Properties
+        # Oracle 커넥션 속성 설정
         connection_props = {}
         if config.connection_timeout_seconds > 0:
             timeout_ms = str(config.connection_timeout_seconds * 1000)
@@ -1695,15 +1699,17 @@ class OracleJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
-        # Use a shorter timeout for acquiring connection to fail fast if pool is empty/DB down
-        # This will block for at most validation_timeout (3s) per try, max 3 tries = 9s
+        # 풀이 비었거나 DB가 다운된 경우 빠르게 실패하도록 짧은 타임아웃 사용
+        # 시도당 최대 validation_timeout(3초) 대기, 최대 3회 시도 = 9초
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         conn = self.pool.acquire(timeout=self.validation_timeout if self.validation_timeout > 0 else 5)
         if conn is None:
              logger.debug("OracleJDBCAdapter: Failed to acquire connection from pool (Timeout/Empty)")
         return conn
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -1712,14 +1718,14 @@ class OracleJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
@@ -1890,10 +1896,11 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('postgresql', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('postgresql', jre_dir)
+        if not jar_file:
             raise RuntimeError("PostgreSQL JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['postgresql'].url_template.format(
@@ -1912,10 +1919,12 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -1924,14 +1933,14 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
@@ -2140,6 +2149,7 @@ CREATE TABLE load_test (
 # 커넥션을 사용하면 다른 클라이언트의 연결이 거부될 수 있습니다.
 # 또한 MySQL Connector/J의 경우 많은 수의 동시 커넥션에서 성능 저하가 발생할 수 있습니다.
 # 필요시 이 값을 조정할 수 있지만, MySQL 서버의 max_connections 설정도 함께 조정해야 합니다.
+# MySQL 커넥션 풀 최대 크기 제한 상수
 MYSQL_MAX_POOL_SIZE = 32
 
 
@@ -2159,20 +2169,26 @@ class MySQLJDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('mysql', jre_dir)
-        if not self.jar_file:
+        # 커넥션 풀 초기화 (None으로 시작)
+        self.pool: Optional[JDBCConnectionPool] = None
+        # MySQL JDBC 드라이버 JAR 파일 검색
+        jar_file = find_jdbc_jar('mysql', jre_dir)
+        if not jar_file:
+            # JDBC 드라이버를 찾지 못한 경우 예외 발생
             raise RuntimeError("MySQL JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
+        # MySQL JDBC 연결 URL 생성 (기본 포트: 3306)
         jdbc_url = JDBC_DRIVERS['mysql'].url_template.format(
             host=config.host, port=config.port or 3306, database=config.database
         )
 
-        # MySQL 커넥션 풀 크기 제한 적용
+        # MySQL 커넥션 풀 크기 제한 적용 (최대 크기 초과 방지)
         effective_min = min(config.min_pool_size, MYSQL_MAX_POOL_SIZE)
         effective_max = min(config.max_pool_size, MYSQL_MAX_POOL_SIZE)
 
+        # 요청된 풀 크기가 제한을 초과하는 경우 경고 로그 출력
         if config.min_pool_size > MYSQL_MAX_POOL_SIZE or config.max_pool_size > MYSQL_MAX_POOL_SIZE:
             logger.warning(
                 f"[MySQL] Pool size limited to {MYSQL_MAX_POOL_SIZE} "
@@ -2180,6 +2196,7 @@ class MySQLJDBCAdapter(DatabaseAdapter):
                 f"See MYSQL_MAX_POOL_SIZE constant for details."
             )
 
+        # JDBC 커넥션 풀 생성 및 설정 적용
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['mysql'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
@@ -2193,35 +2210,49 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        # 풀이 초기화되지 않은 경우 예외 발생
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
+        # 풀에서 커넥션 획득
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        # 커넥션과 풀이 유효한 경우에만 처리
+        if connection and self.pool:
             try:
                 if is_error:
+                    # 에러 발생 시 트랜잭션 롤백
                     connection.rollback()
+                # 커넥션을 풀에 반환
                 self.pool.release(connection)
             except:
+                # 반환 중 예외 발생 시 무시
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        # 커넥션과 풀이 유효한 경우 커넥션 폐기
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
+        # 풀이 존재하는 경우 모든 커넥션 종료
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
+        # 풀이 존재하면 통계 반환, 없으면 빈 딕셔너리 반환
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
+        # INSERT 쿼리 실행 (NOW()로 현재 시간 삽입)
         cursor.execute("""
             INSERT INTO load_test (thread_id, value_col, random_data, created_at)
             VALUES (?, ?, ?, NOW())
         """, [thread_id, f'TEST_{thread_id}', random_data])
+        # 방금 삽입된 행의 AUTO_INCREMENT 값 조회
         cursor.execute("SELECT LAST_INSERT_ID()")
         result = cursor.fetchone()
+        # 삽입된 ID 값 반환
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
@@ -2425,15 +2456,21 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('sqlserver', jre_dir)
-        if not self.jar_file:
+        # 커넥션 풀 초기화 (None으로 시작)
+        self.pool: Optional[JDBCConnectionPool] = None
+        # SQL Server JDBC 드라이버 JAR 파일 검색
+        jar_file = find_jdbc_jar('sqlserver', jre_dir)
+        if not jar_file:
+            # JDBC 드라이버를 찾지 못한 경우 예외 발생
             raise RuntimeError("SQL Server JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
+        # SQL Server JDBC 연결 URL 생성 (기본 포트: 1433)
         jdbc_url = JDBC_DRIVERS['sqlserver'].url_template.format(
             host=config.host, port=config.port or 1433, database=config.database
         )
+        # JDBC 커넥션 풀 생성 및 설정 적용
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['sqlserver'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
@@ -2447,35 +2484,49 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        # 풀이 초기화되지 않은 경우 예외 발생
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
+        # 풀에서 커넥션 획득
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        # 커넥션과 풀이 유효한 경우에만 처리
+        if connection and self.pool:
             try:
                 if is_error:
+                    # 에러 발생 시 트랜잭션 롤백
                     connection.rollback()
+                # 커넥션을 풀에 반환
                 self.pool.release(connection)
             except:
+                # 반환 중 예외 발생 시 무시
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        # 커넥션과 풀이 유효한 경우 커넥션 폐기
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
+        # 풀이 존재하는 경우 모든 커넥션 종료
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
+        # 풀이 존재하면 통계 반환, 없으면 빈 딕셔너리 반환
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
+        # INSERT 쿼리 실행 (GETDATE()로 현재 시간 삽입)
         cursor.execute("""
             INSERT INTO load_test (thread_id, value_col, random_data, created_at)
             VALUES (?, ?, ?, GETDATE())
         """, [thread_id, f'TEST_{thread_id}', random_data])
+        # 방금 삽입된 행의 IDENTITY 값 조회
         cursor.execute("SELECT SCOPE_IDENTITY()")
         result = cursor.fetchone()
+        # 삽입된 ID 값 반환
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
@@ -2678,15 +2729,21 @@ class TiberoJDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('tibero', jre_dir)
-        if not self.jar_file:
+        # 커넥션 풀 초기화 (None으로 시작)
+        self.pool: Optional[JDBCConnectionPool] = None
+        # Tibero JDBC 드라이버 JAR 파일 검색
+        jar_file = find_jdbc_jar('tibero', jre_dir)
+        if not jar_file:
+            # JDBC 드라이버를 찾지 못한 경우 예외 발생
             raise RuntimeError("Tibero JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
+        # Tibero JDBC 연결 URL 생성 (기본 포트: 8629)
         jdbc_url = JDBC_DRIVERS['tibero'].url_template.format(
             host=config.host, port=config.port or 8629, sid=config.sid or config.database
         )
+        # JDBC 커넥션 풀 생성 및 설정 적용
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['tibero'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
@@ -2700,35 +2757,49 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        # 풀이 초기화되지 않은 경우 예외 발생
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
+        # 풀에서 커넥션 획득
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        # 커넥션과 풀이 유효한 경우에만 처리
+        if connection and self.pool:
             try:
                 if is_error:
+                    # 에러 발생 시 트랜잭션 롤백
                     connection.rollback()
+                # 커넥션을 풀에 반환
                 self.pool.release(connection)
             except:
+                # 반환 중 예외 발생 시 무시
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        # 커넥션과 풀이 유효한 경우 커넥션 폐기
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
+        # 풀이 존재하는 경우 모든 커넥션 종료
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
+        # 풀이 존재하면 통계 반환, 없으면 빈 딕셔너리 반환
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
+        # INSERT 쿼리 실행 (시퀀스로 ID 생성, SYSTIMESTAMP로 현재 시간 삽입)
         cursor.execute("""
             INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
             VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
         """, [thread_id, f'TEST_{thread_id}', random_data])
+        # 방금 삽입된 시퀀스의 현재 값 조회
         cursor.execute("SELECT LOAD_TEST_SEQ.CURRVAL FROM DUAL")
         result = cursor.fetchone()
+        # 삽입된 ID 값 반환
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
@@ -2744,12 +2815,15 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             삽입된 레코드 수 (batch_size)
         """
+        # 500자 랜덤 문자열 생성 (배치 전체에서 동일하게 사용)
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
+        # 지정된 배치 크기만큼 반복 INSERT
         for _ in range(batch_size):
             cursor.execute("""
                 INSERT INTO LOAD_TEST (ID, THREAD_ID, VALUE_COL, RANDOM_DATA, CREATED_AT)
                 VALUES (LOAD_TEST_SEQ.NEXTVAL, ?, ?, ?, SYSTIMESTAMP)
             """, [thread_id, f'TEST_{thread_id}', random_data])
+        # 삽입된 레코드 수 반환
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
@@ -2762,7 +2836,9 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             조회된 레코드 튜플, 없으면 None
         """
+        # 지정된 ID로 레코드 조회
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
+        # 조회 결과 반환 (없으면 None)
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
@@ -2775,10 +2851,14 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             조회된 레코드 튜플, 없으면 None
         """
+        # 최대 ID가 0 이하인 경우 조회 불가
         if max_id <= 0:
             return None
+        # 1부터 max_id 사이의 랜덤 ID 생성
         random_id = random.randint(1, max_id)
+        # 랜덤 ID로 레코드 조회
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [random_id])
+        # 조회 결과 반환 (없으면 None)
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
@@ -2791,8 +2871,10 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             업데이트 성공 시 True, 실패 시 False
         """
+        # VALUE_COL과 UPDATED_AT 컬럼 업데이트
         cursor.execute("UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = SYSTIMESTAMP WHERE ID = ?",
                        [f'UPDATED_{record_id}', record_id])
+        # 영향받은 행이 있으면 True 반환
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
@@ -2805,7 +2887,9 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             삭제 성공 시 True, 실패 시 False
         """
+        # 지정된 ID의 레코드 삭제
         cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
+        # 영향받은 행이 있으면 True 반환
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
@@ -2817,8 +2901,10 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         Returns:
             최대 ID 값, 레코드가 없으면 0
         """
+        # 테이블에서 최대 ID 조회 (없으면 0 반환)
         cursor.execute("SELECT NVL(MAX(ID), 0) FROM LOAD_TEST")
         result = cursor.fetchone()
+        # 결과가 있으면 정수로 변환하여 반환, 없으면 0
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
@@ -2917,9 +3003,11 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
             connection.commit()
             logger.info("Tibero schema created successfully")
         except Exception as e:
+            # 스키마 생성 실패 시 에러 로그 출력 및 예외 재발생
             logger.error(f"Failed to setup Tibero schema: {e}")
             raise
         finally:
+            # 커서 리소스 정리
             cursor.close()
 
     def truncate_table(self, connection):
@@ -2933,20 +3021,26 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
         """
         cursor = connection.cursor()
         try:
+            # 테이블의 모든 데이터 삭제 (빠른 삭제)
             cursor.execute("TRUNCATE TABLE LOAD_TEST")
+            # 기존 시퀀스 삭제
             cursor.execute("DROP SEQUENCE LOAD_TEST_SEQ")
+            # 시퀀스를 1부터 다시 생성 (캐시 1000, 순환 없음, 순서 보장)
             cursor.execute("CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER")
+            # 변경사항 커밋
             connection.commit()
             logger.info("Table LOAD_TEST truncated and sequence LOAD_TEST_SEQ reset to 1")
         except Exception as e:
+            # 테이블 초기화 실패 시 에러 로그 출력 및 예외 재발생
             logger.error(f"Failed to truncate Tibero table: {e}")
             raise
         finally:
+            # 커서 리소스 정리
             cursor.close()
 
 
 # ============================================================================
-# DB2 JDBC Adapter
+# DB2 JDBC 어댑터
 # ============================================================================
 class DB2JDBCAdapter(DatabaseAdapter):
     """IBM DB2 JDBC 어댑터
@@ -2955,15 +3049,21 @@ class DB2JDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('db2', jre_dir)
-        if not self.jar_file:
+        # 커넥션 풀 초기화 (None으로 시작)
+        self.pool: Optional[JDBCConnectionPool] = None
+        # DB2 JDBC 드라이버 JAR 파일 검색
+        jar_file = find_jdbc_jar('db2', jre_dir)
+        if not jar_file:
+            # JDBC 드라이버를 찾지 못한 경우 예외 발생
             raise RuntimeError("DB2 JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
+        # DB2 JDBC 연결 URL 생성 (기본 포트: 50000)
         jdbc_url = JDBC_DRIVERS['db2'].url_template.format(
             host=config.host, port=config.port or 50000, database=config.database
         )
+        # JDBC 커넥션 풀 생성 및 설정 적용
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['db2'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
@@ -2977,10 +3077,14 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        # 풀이 초기화되지 않은 경우 예외 발생
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
+        # 풀에서 커넥션 획득
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -2989,14 +3093,14 @@ class DB2JDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
         if self.pool:
             self.pool.close_all()
 
-    def get_pool_stats(self) -> Dict[str, int]:
+    def get_pool_stats(self) -> Dict[str, Union[int, str]]:
         return self.pool.get_pool_stats() if self.pool else {}
 
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
@@ -3296,7 +3400,7 @@ class LoadTestWorker:
 
     def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
                  mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
-                 rate_limiter: RateLimiter = None, ramp_up_end_time: datetime = None):
+                 rate_limiter: Optional[RateLimiter] = None, ramp_up_end_time: Optional[datetime] = None):
         """LoadTestWorker 초기화
 
         Args:
@@ -3384,7 +3488,8 @@ class LoadTestWorker:
                     return conn
                 if conn:
                     self.db_adapter.discard_connection(conn)
-                    perf_counter.increment_connection_recreate()
+                    if perf_counter:
+                        perf_counter.increment_connection_recreate()
             except Exception:
                 pass
 
@@ -3443,35 +3548,57 @@ class LoadTestWorker:
             성공 시 True, 실패 시 False
         """
         cursor = None
+        # 작업 시작 시간 기록 (레이턴시 측정용)
         start_time = time.time()
         try:
+            # 커서 생성
             cursor = connection.cursor()
+            # 워커 스레드 이름을 thread_id로 사용
             thread_id = self.thread_name
+            # 테스트용 랜덤 데이터 생성 (500자)
             random_data = self.generate_random_data()
 
+            # 배치 모드 여부에 따른 분기 처리
             if self.batch_size > 1:
+                # 배치 INSERT: 지정된 개수만큼 한 번에 삽입
                 count = self.db_adapter.execute_batch_insert(cursor, thread_id, self.batch_size)
-                perf_counter.increment_insert(count)
+                # 배치 개수만큼 INSERT 카운터 증가
+                if perf_counter:
+                    perf_counter.increment_insert(count)
             else:
+                # 단일 INSERT: 1건 삽입
                 self.db_adapter.execute_insert(cursor, thread_id, random_data)
-                perf_counter.increment_insert()
+                # INSERT 카운터 1 증가
+                if perf_counter:
+                    perf_counter.increment_insert()
 
+            # 트랜잭션 커밋 (데이터 영구 저장)
             self.db_adapter.commit(connection)
 
+            # 레이턴시 계산 (밀리초 단위)
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            # 트랜잭션 완료 기록 (TPS 및 레이턴시 통계용)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
+            # 워커별 트랜잭션 카운트 증가
             self.transaction_count += 1
             return True
         except Exception as e:
+            # 에러 발생 시 로그 기록
             self.log_error("Insert", str(e))
-            perf_counter.increment_error()
+            # 에러 카운터 증가
+            if perf_counter:
+                perf_counter.increment_error()
+            # 트랜잭션 롤백 (변경사항 취소)
             self.db_adapter.rollback(connection)
             return False
         finally:
+            # 커서 정리 (리소스 해제)
             if cursor:
                 try:
                     cursor.close()
                 except:
+                    # 커서 닫기 실패 시 무시
                     pass
 
     def execute_select(self, connection, max_id: int) -> bool:
@@ -3485,25 +3612,40 @@ class LoadTestWorker:
             성공 시 True, 실패 시 False
         """
         cursor = None
+        # 작업 시작 시간 기록 (레이턴시 측정용)
         start_time = time.time()
         try:
+            # 커서 생성
             cursor = connection.cursor()
+            # 1~max_id 범위에서 랜덤 ID로 조회 수행
             self.db_adapter.execute_random_select(cursor, max_id)
-            perf_counter.increment_select()
+            # SELECT 카운터 증가
+            if perf_counter:
+                perf_counter.increment_select()
 
+            # 레이턴시 계산 (밀리초 단위)
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            # 트랜잭션 완료 기록 (TPS 및 레이턴시 통계용)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
+            # 워커별 트랜잭션 카운트 증가
             self.transaction_count += 1
             return True
         except Exception as e:
+            # 에러 발생 시 로그 기록
             self.log_error("Select", str(e))
-            perf_counter.increment_error()
+            # 에러 카운터 증가
+            if perf_counter:
+                perf_counter.increment_error()
+            # SELECT는 읽기 전용이므로 롤백 불필요
             return False
         finally:
+            # 커서 정리 (리소스 해제)
             if cursor:
                 try:
                     cursor.close()
                 except:
+                    # 커서 닫기 실패 시 무시
                     pass
 
     def execute_update(self, connection, max_id: int) -> bool:
@@ -3517,30 +3659,48 @@ class LoadTestWorker:
             성공 시 True, 실패 시 False
         """
         cursor = None
+        # 작업 시작 시간 기록 (레이턴시 측정용)
         start_time = time.time()
         try:
+            # 커서 생성
             cursor = connection.cursor()
+            # 1~max_id 범위에서 랜덤 ID 선택
             record_id = self.db_adapter.get_random_id(cursor, max_id)
+            # 유효한 ID가 없으면 성공으로 처리 (데이터 없음)
             if record_id <= 0:
                 return True
+            # 선택된 ID의 레코드 업데이트 수행
             self.db_adapter.execute_update(cursor, record_id)
+            # 트랜잭션 커밋 (변경사항 영구 저장)
             self.db_adapter.commit(connection)
-            perf_counter.increment_update()
+            # UPDATE 카운터 증가
+            if perf_counter:
+                perf_counter.increment_update()
 
+            # 레이턴시 계산 (밀리초 단위)
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            # 트랜잭션 완료 기록 (TPS 및 레이턴시 통계용)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
+            # 워커별 트랜잭션 카운트 증가
             self.transaction_count += 1
             return True
         except Exception as e:
+            # 에러 발생 시 로그 기록
             self.log_error("Update", str(e))
-            perf_counter.increment_error()
+            # 에러 카운터 증가
+            if perf_counter:
+                perf_counter.increment_error()
+            # 트랜잭션 롤백 (변경사항 취소)
             self.db_adapter.rollback(connection)
             return False
         finally:
+            # 커서 정리 (리소스 해제)
             if cursor:
                 try:
                     cursor.close()
                 except:
+                    # 커서 닫기 실패 시 무시
                     pass
 
     def execute_delete(self, connection, max_id: int) -> bool:
@@ -3554,30 +3714,48 @@ class LoadTestWorker:
             성공 시 True, 실패 시 False
         """
         cursor = None
+        # 작업 시작 시간 기록 (레이턴시 측정용)
         start_time = time.time()
         try:
+            # 커서 생성
             cursor = connection.cursor()
+            # 1~max_id 범위에서 랜덤 ID 선택
             record_id = self.db_adapter.get_random_id(cursor, max_id)
+            # 유효한 ID가 없으면 성공으로 처리 (데이터 없음)
             if record_id <= 0:
                 return True
+            # 선택된 ID의 레코드 삭제 수행
             self.db_adapter.execute_delete(cursor, record_id)
+            # 트랜잭션 커밋 (삭제 영구 반영)
             self.db_adapter.commit(connection)
-            perf_counter.increment_delete()
+            # DELETE 카운터 증가
+            if perf_counter:
+                perf_counter.increment_delete()
 
+            # 레이턴시 계산 (밀리초 단위)
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            # 트랜잭션 완료 기록 (TPS 및 레이턴시 통계용)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
+            # 워커별 트랜잭션 카운트 증가
             self.transaction_count += 1
             return True
         except Exception as e:
+            # 에러 발생 시 로그 기록
             self.log_error("Delete", str(e))
-            perf_counter.increment_error()
+            # 에러 카운터 증가
+            if perf_counter:
+                perf_counter.increment_error()
+            # 트랜잭션 롤백 (삭제 취소)
             self.db_adapter.rollback(connection)
             return False
         finally:
+            # 커서 정리 (리소스 해제)
             if cursor:
                 try:
                     cursor.close()
                 except:
+                    # 커서 닫기 실패 시 무시
                     pass
 
     def execute_mixed(self, connection, max_id: int) -> bool:
@@ -3593,13 +3771,18 @@ class LoadTestWorker:
         Returns:
             성공 시 True, 실패 시 False
         """
+        # 0.0 ~ 1.0 사이의 랜덤 값 생성
         rand = random.random()
+        # 60% 확률: INSERT 실행
         if rand < 0.60:
             return self.execute_insert(connection)
+        # 20% 확률: SELECT 실행 (누적 80%)
         elif rand < 0.80:
             return self.execute_select(connection, max_id)
+        # 15% 확률: UPDATE 실행 (누적 95%)
         elif rand < 0.95:
             return self.execute_update(connection, max_id)
+        # 5% 확률: DELETE 실행 (나머지)
         else:
             return self.execute_delete(connection, max_id)
 
@@ -3616,45 +3799,77 @@ class LoadTestWorker:
             성공 시 True, 실패 시 False
         """
         cursor = None
+        # 작업 시작 시간 기록 (전체 CRUD 사이클 레이턴시 측정용)
         start_time = time.time()
         try:
+            # 커서 생성
             cursor = connection.cursor()
+            # 워커 스레드 이름을 thread_id로 사용
             thread_id = self.thread_name
+            # 테스트용 랜덤 데이터 생성 (500자)
             random_data = self.generate_random_data()
 
+            # [1단계] INSERT 실행 - 새 레코드 삽입
             new_id = self.db_adapter.execute_insert(cursor, thread_id, random_data)
-            perf_counter.increment_insert()
+            # INSERT 카운터 증가
+            if perf_counter:
+                perf_counter.increment_insert()
+            # INSERT 커밋 (데이터 영구 저장)
             self.db_adapter.commit(connection)
 
+            # [2단계] SELECT 실행 - 방금 삽입한 레코드 조회
             result = self.db_adapter.execute_select(cursor, new_id)
-            perf_counter.increment_select()
+            # SELECT 카운터 증가
+            if perf_counter:
+                perf_counter.increment_select()
 
+            # [3단계] VERIFY - 조회 결과 검증 (데이터 무결성 확인)
             if result is None or result[0] != new_id:
-                perf_counter.increment_verification_failure()
+                # 검증 실패: 삽입한 데이터를 조회할 수 없음
+                if perf_counter:
+                    perf_counter.increment_verification_failure()
                 return False
 
+            # [4단계] UPDATE 실행 - 레코드 수정
             self.db_adapter.execute_update(cursor, new_id)
-            perf_counter.increment_update()
+            # UPDATE 카운터 증가
+            if perf_counter:
+                perf_counter.increment_update()
+            # UPDATE 커밋 (변경사항 영구 저장)
             self.db_adapter.commit(connection)
 
+            # [5단계] DELETE 실행 - 레코드 삭제
             self.db_adapter.execute_delete(cursor, new_id)
-            perf_counter.increment_delete()
+            # DELETE 카운터 증가
+            if perf_counter:
+                perf_counter.increment_delete()
+            # DELETE 커밋 (삭제 영구 반영)
             self.db_adapter.commit(connection)
 
+            # 전체 CRUD 사이클 레이턴시 계산 (밀리초 단위)
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            # 트랜잭션 완료 기록 (TPS 및 레이턴시 통계용)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
+            # 워커별 트랜잭션 카운트 증가
             self.transaction_count += 1
             return True
         except Exception as e:
+            # 에러 발생 시 로그 기록
             self.log_error("Transaction", str(e))
-            perf_counter.increment_error()
+            # 에러 카운터 증가
+            if perf_counter:
+                perf_counter.increment_error()
+            # 트랜잭션 롤백 (미완료 변경사항 취소)
             self.db_adapter.rollback(connection)
             return False
         finally:
+            # 커서 정리 (리소스 해제)
             if cursor:
                 try:
                     cursor.close()
                 except:
+                    # 커서 닫기 실패 시 무시
                     pass
 
     def run(self) -> int:
@@ -3678,11 +3893,11 @@ class LoadTestWorker:
         max_id = self.max_id_cache
 
         while datetime.now() < self.end_time:
-            # Graceful shutdown 체크
+            # 우아한 종료 요청 확인
             if shutdown_handler and shutdown_handler.is_shutdown_requested():
                 break
 
-            # Rate limiting (목표 TPS 제어)
+            # TPS 속도 제한 (Rate Limiting)
             if self.rate_limiter and not self.rate_limiter.acquire(timeout=0.5):
                 continue
 
@@ -3692,7 +3907,7 @@ class LoadTestWorker:
                     now = time.time()
                     if now - self.last_error_log_time > 5: # 5초마다 로그
                          logger.warning(
-                             f"[{self.thread_name}] 커넥션 대기 중... "
+                             f"[{self.thread_name}] Waiting for connection... "
                              f"(Pool: {self.db_adapter.get_pool_stats().get('pool_total', '?')})"
                          )
                          self.last_error_log_time = now
@@ -3711,8 +3926,8 @@ class LoadTestWorker:
                             # 연속 2회 이상 실패 시 백오프 적용
                             # DB 재기동 등 일시적 연결 불가 시 과부하 방지
                             logger.warning(
-                                f"[{self.thread_name}] 연속 {consecutive_errors}회 실패. "
-                                f"{self.current_backoff_ms}ms 백오프 후 재시도..."
+                                f"[{self.thread_name}] {consecutive_errors} consecutive failures. "
+                                f"Retrying after {self.current_backoff_ms}ms backoff..."
                             )
                             time.sleep(self.current_backoff_ms / 1000.0)
                             self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
@@ -3726,15 +3941,17 @@ class LoadTestWorker:
                         # 손상된 커넥션: 폐기 및 새 커넥션 획득
                         self.db_adapter.discard_connection(connection)
                         connection = self._get_valid_connection()
-                        perf_counter.increment_connection_recreate()
+                        if perf_counter:
+                            perf_counter.increment_connection_recreate()
 
                 # SELECT/UPDATE/DELETE/MIXED 모드: 기존 데이터 필요
                 needs_data = self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
                                            WorkMode.DELETE_ONLY, WorkMode.MIXED]
                 if needs_data and (max_id == 0 or self.transaction_count % 100 == 0):
-                    cursor = connection.cursor()
-                    max_id = self.db_adapter.get_max_id(cursor)
-                    cursor.close()
+                    if connection:
+                        cursor = connection.cursor()
+                        max_id = self.db_adapter.get_max_id(cursor)
+                        cursor.close()
                     if max_id == 0:
                         time.sleep(1)
                         continue
@@ -3760,10 +3977,11 @@ class LoadTestWorker:
                         # 연속 2회 이상 실패 시 커넥션 폐기 및 재시도
                         self.db_adapter.discard_connection(connection)
                         connection = None
-                        perf_counter.increment_connection_recreate()
+                        if perf_counter:
+                            perf_counter.increment_connection_recreate()
                         logger.warning(
-                            f"[{self.thread_name}] 작업 실패. "
-                            f"{self.current_backoff_ms}ms 백오프 후 재시도..."
+                            f"[{self.thread_name}] Operation failed. "
+                            f"Retrying after {self.current_backoff_ms}ms backoff..."
                         )
                         time.sleep(self.current_backoff_ms / 1000.0)
                         self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
@@ -3773,11 +3991,13 @@ class LoadTestWorker:
 
             except Exception as e:
                 self.log_error("Connection", str(e))
-                perf_counter.increment_error()
+                if perf_counter:
+                    perf_counter.increment_error()
                 if connection:
                     self.db_adapter.discard_connection(connection)
                     connection = None
-                    perf_counter.increment_connection_recreate()
+                    if perf_counter:
+                        perf_counter.increment_connection_recreate()
                 time.sleep(self.current_backoff_ms / 1000.0)
                 self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
 
@@ -3829,6 +4049,10 @@ class MonitorThread(threading.Thread):
                 break
 
             time.sleep(self.interval_seconds)
+
+            # perf_counter가 초기화되지 않은 경우 스킵
+            if perf_counter is None:
+                continue
 
             interval_stats = perf_counter.get_interval_stats()
             stats = perf_counter.get_stats()
@@ -3936,13 +4160,13 @@ class MultiDBLoadTester:
                       monitor_interval: float = 1.0, sub_second_interval_ms: int = 100,
                       warmup_seconds: int = 30, ramp_up_seconds: int = 0,
                       target_tps: int = 0, batch_size: int = 1,
-                      output_format: str = None, output_file: str = None):
+                      output_format: Optional[str] = None, output_file: Optional[str] = None):
         """부하 테스트 실행"""
         global perf_counter, shutdown_handler
 
         logger.info(f"Starting load test: {thread_count} threads for {duration_seconds}s (mode: {mode})")
 
-        # Graceful shutdown 핸들러
+        # 우아한 종료 핸들러 초기화
         shutdown_handler = GracefulShutdown()
 
         # 성능 카운터 초기화
@@ -3967,6 +4191,9 @@ class MultiDBLoadTester:
         if truncate_table:
             logger.info("Truncating table...")
             conn = self.db_adapter.get_connection()
+            if not conn:
+                logger.error("Failed to get connection for table truncation")
+                sys.exit(1)
             try:
                 self.db_adapter.truncate_table(conn)
             except Exception as e:
@@ -3980,10 +4207,11 @@ class MultiDBLoadTester:
         max_id_cache = 0
         if mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY, WorkMode.DELETE_ONLY, WorkMode.MIXED]:
             conn = self.db_adapter.get_connection()
-            cursor = conn.cursor()
-            max_id_cache = self.db_adapter.get_max_id(cursor)
-            cursor.close()
-            self.db_adapter.release_connection(conn)
+            if conn:
+                cursor = conn.cursor()
+                max_id_cache = self.db_adapter.get_max_id(cursor)
+                cursor.close()
+                self.db_adapter.release_connection(conn)
             logger.info(f"Found {max_id_cache} existing records")
 
         # 시간 설정
@@ -3993,7 +4221,7 @@ class MultiDBLoadTester:
         end_time = now + timedelta(seconds=duration_seconds + warmup_seconds)
 
         # 워밍업 설정
-        if warmup_seconds > 0:
+        if warmup_seconds > 0 and perf_counter and warmup_end_time:
             perf_counter.set_warmup_end_time(warmup_end_time.timestamp())
             logger.info("=" * 80)
             logger.info("Warmup period: %s seconds (Avg TPS will be calculated after warmup)", warmup_seconds)
@@ -4007,7 +4235,7 @@ class MultiDBLoadTester:
             logger.info("No warmup period. Test duration: %s seconds", duration_seconds)
             logger.info("=" * 80)
 
-        # Rate limiter
+        # TPS 속도 제한기
         rate_limiter = RateLimiter(target_tps) if target_tps > 0 else None
         if target_tps > 0:
             logger.info(f"Target TPS: {target_tps}")
@@ -4021,14 +4249,14 @@ class MultiDBLoadTester:
         )
         monitor.start()
 
-        # Ramp-up 지원 워커 실행
+        # Ramp-up 적용 워커 실행
         total_transactions = 0
         ramp_up_delay = ramp_up_seconds / thread_count if ramp_up_seconds > 0 else 0
 
         with ThreadPoolExecutor(max_workers=thread_count, thread_name_prefix="Worker") as executor:
             futures = []
             for i in range(thread_count):
-                # Ramp-up 딜레이
+                # Ramp-up 간격 대기
                 if ramp_up_delay > 0 and i > 0:
                     time.sleep(ramp_up_delay)
                     if shutdown_handler.is_shutdown_requested():
@@ -4059,7 +4287,8 @@ class MultiDBLoadTester:
 
         # 최종 통계 출력
         self._print_final_stats(thread_count, duration_seconds, total_transactions, mode,
-                                warmup_seconds, target_tps, batch_size)
+                                warmup_seconds, target_tps, batch_size,
+                                now, warmup_end_time, end_time)
 
         # 결과 내보내기
         if output_format and output_file:
@@ -4069,7 +4298,8 @@ class MultiDBLoadTester:
 
     def _print_final_stats(self, thread_count: int, duration_seconds: int,
                            total_transactions: int, mode: str,
-                           warmup_seconds: int, target_tps: int, batch_size: int):
+                           warmup_seconds: int, target_tps: int, batch_size: int,
+                           start_time: datetime, warmup_end_time: Optional[datetime], end_time: datetime):
         """최종 통계 출력
 
         테스트 완료 후 최종 성능 통계를 로그로 출력합니다.
@@ -4083,6 +4313,8 @@ class MultiDBLoadTester:
             target_tps: 목표 TPS
             batch_size: 배치 크기
         """
+        if not perf_counter:
+            return
         final_stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
 
@@ -4097,6 +4329,12 @@ class MultiDBLoadTester:
             logger.info(f"Target TPS: {target_tps}")
         if batch_size > 1:
             logger.info(f"Batch Size: {batch_size}")
+        logger.info(f"Start Time (Warmup): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if warmup_end_time:
+            logger.info(f"Start Time (Running): {warmup_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            logger.info(f"Start Time (Running): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"End Time (Running): {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("-" * 80)
         logger.info(f"Total Transactions: {final_stats['total_transactions']:,}")
         logger.info(f"  - Inserts: {final_stats['total_inserts']:,}")
@@ -4134,6 +4372,8 @@ class MultiDBLoadTester:
             duration_seconds: 테스트 실행 시간 (초)
             mode: 작업 모드
         """
+        if not perf_counter:
+            return
         stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
         time_series = perf_counter.time_series
@@ -4175,23 +4415,23 @@ Work Modes:
   delete-only : DELETE only (requires existing data)
   mixed       : INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%
 
-Examples:
-  # Basic usage
+사용 예시:
+  # 기본 사용법
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --thread-count 200
 
-  # With warmup and ramp-up
+  # 워밍업 및 Ramp-up 적용
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --warmup 30 --ramp-up 60
 
-  # Batch INSERT with rate limiting
+  # 배치 INSERT 및 TPS 제한
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --mode insert-only --batch-size 100 --target-tps 5000
 
-  # Export results
+  # 결과 내보내기
   python multi_db_load_tester_jdbc.py --db-type oracle \\
       --host localhost --port 1521 --sid XEPDB1 \\
       --user test --password pass --output-format json --output-file results.json
@@ -4301,18 +4541,8 @@ def main():
         connection_timeout_seconds=args.connection_timeout
     )
 
-    # JVM 초기화 (Timeouts via System Properties for extra safety)
-    jvm_extra_args = []
-    if args.db_type == 'oracle' and args.connection_timeout > 0:
-        timeout_ms = str(args.connection_timeout * 1000)
-        jvm_extra_args.append(f"-Doracle.net.CONNECT_TIMEOUT={timeout_ms}")
-        jvm_extra_args.append(f"-Doracle.jdbc.ReadTimeout={timeout_ms}")
-        # Generic Java socket timeouts as fallback
-        jvm_extra_args.append(f"-Dsun.net.client.defaultConnectTimeout={timeout_ms}")
-        jvm_extra_args.append(f"-Dsun.net.client.defaultReadTimeout={timeout_ms}")
-        logger.info(f"Adding JVM args for Oracle timeouts: {jvm_extra_args}")
-
-    initialize_jvm(args.jre_dir, extra_args=jvm_extra_args)
+    # JVM 초기화
+    initialize_jvm(args.jre_dir)
 
     if not os.path.exists(args.jre_dir):
         logger.error(f"JRE directory not found: {args.jre_dir}")

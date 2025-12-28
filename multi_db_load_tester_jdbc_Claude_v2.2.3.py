@@ -325,7 +325,7 @@ class PerformanceCounter:
 
         return float(count)
 
-    def get_windowed_tps(self, window_ms: int = None) -> float:
+    def get_windowed_tps(self, window_ms: Optional[int] = None) -> float:
         """지정된 윈도우 내 TPS"""
         if window_ms is None:
             window_ms = self.sub_second_window_ms
@@ -391,7 +391,7 @@ class PerformanceCounter:
                 'interval_tps': round(interval_tps, 2)
             }
 
-    def record_time_series(self, pool_stats: Dict[str, int] = None):
+    def record_time_series(self, pool_stats: Optional[Dict[str, int]] = None):
         """시계열 데이터 기록"""
         current_time = time.time()
         stats = self.get_stats()
@@ -724,7 +724,7 @@ class PooledConnection:
     acquired_by: Optional[str] = None
     last_used_at: float = field(default_factory=time.time)
 
-    def mark_acquired(self, thread_name: str = None):
+    def mark_acquired(self, thread_name: Optional[str] = None):
         """커넥션 획득 시 호출"""
         self.acquired_at = time.time()
         self.acquired_by = thread_name or threading.current_thread().name
@@ -1073,7 +1073,7 @@ class JDBCConnectionPool:
                 'pool_leak_warnings': self.total_leaked_warnings
             }
 
-    def acquire(self, timeout: int = None):
+    def acquire(self, timeout: Optional[int] = None) -> Optional[Any]:
         """커넥션 획득
 
         Returns:
@@ -1381,6 +1381,10 @@ class DatabaseAdapter(ABC):
     def setup_schema(self, connection):
         pass
 
+    @abstractmethod
+    def truncate_table(self, connection):
+        pass
+
 
 # ============================================================================
 # Oracle JDBC 어댑터
@@ -1389,10 +1393,11 @@ class OracleJDBCAdapter(DatabaseAdapter):
     """Oracle JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('oracle', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('oracle', jre_dir)
+        if not jar_file:
             raise RuntimeError("Oracle JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         if config.service_name:
@@ -1441,10 +1446,12 @@ class OracleJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -1453,7 +1460,7 @@ class OracleJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -1619,10 +1626,11 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
     """PostgreSQL JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('postgresql', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('postgresql', jre_dir)
+        if not jar_file:
             raise RuntimeError("PostgreSQL JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['postgresql'].url_template.format(
@@ -1642,10 +1650,12 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -1654,7 +1664,7 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -1806,10 +1816,11 @@ class MySQLJDBCAdapter(DatabaseAdapter):
     """
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('mysql', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('mysql', jre_dir)
+        if not jar_file:
             raise RuntimeError("MySQL JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['mysql'].url_template.format(
@@ -1841,10 +1852,12 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -1853,7 +1866,7 @@ class MySQLJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -1981,10 +1994,11 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
     """SQL Server JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('sqlserver', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('sqlserver', jre_dir)
+        if not jar_file:
             raise RuntimeError("SQL Server JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['sqlserver'].url_template.format(
@@ -2004,10 +2018,12 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -2016,7 +2032,7 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -2143,10 +2159,11 @@ class TiberoJDBCAdapter(DatabaseAdapter):
     """Tibero JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('tibero', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('tibero', jre_dir)
+        if not jar_file:
             raise RuntimeError("Tibero JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['tibero'].url_template.format(
@@ -2166,10 +2183,12 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -2178,7 +2197,7 @@ class TiberoJDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -2330,10 +2349,11 @@ class DB2JDBCAdapter(DatabaseAdapter):
     """IBM DB2 JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
-        self.pool = None
-        self.jar_file = find_jdbc_jar('db2', jre_dir)
-        if not self.jar_file:
+        self.pool: Optional[JDBCConnectionPool] = None
+        jar_file = find_jdbc_jar('db2', jre_dir)
+        if not jar_file:
             raise RuntimeError("DB2 JDBC driver not found")
+        self.jar_file: str = jar_file
 
     def create_connection_pool(self, config: 'DatabaseConfig'):
         jdbc_url = JDBC_DRIVERS['db2'].url_template.format(
@@ -2353,10 +2373,12 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return self.pool
 
     def get_connection(self):
+        if not self.pool:
+            raise RuntimeError("Connection pool not initialized")
         return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
-        if connection:
+        if connection and self.pool:
             try:
                 if is_error:
                     connection.rollback()
@@ -2365,7 +2387,7 @@ class DB2JDBCAdapter(DatabaseAdapter):
                 pass
 
     def discard_connection(self, connection):
-        if connection:
+        if connection and self.pool:
             self.pool.discard(connection)
 
     def close_pool(self):
@@ -2589,7 +2611,7 @@ class LoadTestWorker:
 
     def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
                  mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
-                 rate_limiter: RateLimiter = None, ramp_up_end_time: datetime = None):
+                 rate_limiter: Optional[RateLimiter] = None, ramp_up_end_time: Optional[datetime] = None):
         self.worker_id = worker_id
         self.db_adapter = db_adapter
         self.end_time = end_time
@@ -2658,7 +2680,8 @@ class LoadTestWorker:
                     return conn
                 if conn:
                     self.db_adapter.discard_connection(conn)
-                    perf_counter.increment_connection_recreate()
+                    if perf_counter:
+                        perf_counter.increment_connection_recreate()
             except Exception:
                 pass
 
@@ -2722,20 +2745,24 @@ class LoadTestWorker:
 
             if self.batch_size > 1:
                 count = self.db_adapter.execute_batch_insert(cursor, thread_id, self.batch_size)
-                perf_counter.increment_insert(count)
+                if perf_counter:
+                    perf_counter.increment_insert(count)
             else:
                 self.db_adapter.execute_insert(cursor, thread_id, random_data)
-                perf_counter.increment_insert()
+                if perf_counter:
+                    perf_counter.increment_insert()
 
             self.db_adapter.commit(connection)
 
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
             self.log_error("Insert", str(e))
-            perf_counter.increment_error()
+            if perf_counter:
+                perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
         finally:
@@ -2760,15 +2787,18 @@ class LoadTestWorker:
         try:
             cursor = connection.cursor()
             self.db_adapter.execute_random_select(cursor, max_id)
-            perf_counter.increment_select()
+            if perf_counter:
+                perf_counter.increment_select()
 
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
             self.log_error("Select", str(e))
-            perf_counter.increment_error()
+            if perf_counter:
+                perf_counter.increment_error()
             return False
         finally:
             if cursor:
@@ -2796,15 +2826,18 @@ class LoadTestWorker:
                 return True
             self.db_adapter.execute_update(cursor, record_id)
             self.db_adapter.commit(connection)
-            perf_counter.increment_update()
+            if perf_counter:
+                perf_counter.increment_update()
 
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
             self.log_error("Update", str(e))
-            perf_counter.increment_error()
+            if perf_counter:
+                perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
         finally:
@@ -2833,15 +2866,18 @@ class LoadTestWorker:
                 return True
             self.db_adapter.execute_delete(cursor, record_id)
             self.db_adapter.commit(connection)
-            perf_counter.increment_delete()
+            if perf_counter:
+                perf_counter.increment_delete()
 
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
             self.log_error("Delete", str(e))
-            perf_counter.increment_error()
+            if perf_counter:
+                perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
         finally:
@@ -2888,31 +2924,38 @@ class LoadTestWorker:
             random_data = self.generate_random_data()
 
             new_id = self.db_adapter.execute_insert(cursor, thread_id, random_data)
-            perf_counter.increment_insert()
+            if perf_counter:
+                perf_counter.increment_insert()
             self.db_adapter.commit(connection)
 
             result = self.db_adapter.execute_select(cursor, new_id)
-            perf_counter.increment_select()
+            if perf_counter:
+                perf_counter.increment_select()
 
             if result is None or result[0] != new_id:
-                perf_counter.increment_verification_failure()
+                if perf_counter:
+                    perf_counter.increment_verification_failure()
                 return False
 
             self.db_adapter.execute_update(cursor, new_id)
-            perf_counter.increment_update()
+            if perf_counter:
+                perf_counter.increment_update()
             self.db_adapter.commit(connection)
 
             self.db_adapter.execute_delete(cursor, new_id)
-            perf_counter.increment_delete()
+            if perf_counter:
+                perf_counter.increment_delete()
             self.db_adapter.commit(connection)
 
             latency_ms = (time.time() - start_time) * 1000
-            perf_counter.record_transaction(latency_ms)
+            if perf_counter:
+                perf_counter.record_transaction(latency_ms)
             self.transaction_count += 1
             return True
         except Exception as e:
             self.log_error("Transaction", str(e))
-            perf_counter.increment_error()
+            if perf_counter:
+                perf_counter.increment_error()
             self.db_adapter.rollback(connection)
             return False
         finally:
@@ -2947,14 +2990,16 @@ class LoadTestWorker:
                     if not self._is_connection_valid(connection):
                         self.db_adapter.discard_connection(connection)
                         connection = self._get_valid_connection()
-                        perf_counter.increment_connection_recreate()
+                        if perf_counter:
+                            perf_counter.increment_connection_recreate()
 
                 needs_data = self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
                                            WorkMode.DELETE_ONLY, WorkMode.MIXED]
                 if needs_data and (max_id == 0 or self.transaction_count % 100 == 0):
-                    cursor = connection.cursor()
-                    max_id = self.db_adapter.get_max_id(cursor)
-                    cursor.close()
+                    if connection:
+                        cursor = connection.cursor()
+                        max_id = self.db_adapter.get_max_id(cursor)
+                        cursor.close()
                     if max_id == 0:
                         time.sleep(1)
                         continue
@@ -2978,7 +3023,8 @@ class LoadTestWorker:
                     if consecutive_errors >= 2:
                         self.db_adapter.discard_connection(connection)
                         connection = None
-                        perf_counter.increment_connection_recreate()
+                        if perf_counter:
+                            perf_counter.increment_connection_recreate()
                         time.sleep(self.current_backoff_ms / 1000.0)
                         self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
                 else:
@@ -2987,11 +3033,13 @@ class LoadTestWorker:
 
             except Exception as e:
                 self.log_error("Connection", str(e))
-                perf_counter.increment_error()
+                if perf_counter:
+                    perf_counter.increment_error()
                 if connection:
                     self.db_adapter.discard_connection(connection)
                     connection = None
-                    perf_counter.increment_connection_recreate()
+                    if perf_counter:
+                        perf_counter.increment_connection_recreate()
                 time.sleep(self.current_backoff_ms / 1000.0)
                 self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
 
@@ -3036,6 +3084,8 @@ class MonitorThread(threading.Thread):
         Args:
             tag: 로그 태그
         """
+        if not perf_counter:
+            return
         interval_stats = perf_counter.get_interval_stats()
         stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
@@ -3158,7 +3208,7 @@ class MultiDBLoadTester:
                       monitor_interval: float = 1.0, sub_second_interval_ms: int = 100,
                       warmup_seconds: int = 30, ramp_up_seconds: int = 0,
                       target_tps: int = 0, batch_size: int = 1,
-                      output_format: str = None, output_file: str = None):
+                      output_format: Optional[str] = None, output_file: Optional[str] = None):
         """부하 테스트 실행"""
         global perf_counter, shutdown_handler
 
@@ -3189,7 +3239,11 @@ class MultiDBLoadTester:
         if truncate_table:
             logger.info("Truncating table...")
             conn = self.db_adapter.get_connection()
+            if not conn:
+                logger.error("Failed to get connection for table truncation")
+                sys.exit(1)
             try:
+                assert conn is not None
                 self.db_adapter.truncate_table(conn)
             except Exception as e:
                 logger.error(f"Table truncate failed: {e}")
@@ -3202,10 +3256,11 @@ class MultiDBLoadTester:
         max_id_cache = 0
         if mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY, WorkMode.DELETE_ONLY, WorkMode.MIXED]:
             conn = self.db_adapter.get_connection()
-            cursor = conn.cursor()
-            max_id_cache = self.db_adapter.get_max_id(cursor)
-            cursor.close()
-            self.db_adapter.release_connection(conn)
+            if conn:
+                cursor = conn.cursor()
+                max_id_cache = self.db_adapter.get_max_id(cursor)
+                cursor.close()
+                self.db_adapter.release_connection(conn)
             logger.info(f"Found {max_id_cache} existing records")
 
         # 시간 설정
@@ -3215,7 +3270,7 @@ class MultiDBLoadTester:
         end_time = now + timedelta(seconds=duration_seconds + warmup_seconds)
 
         # 워밍업 설정
-        if warmup_seconds > 0:
+        if warmup_seconds > 0 and perf_counter and warmup_end_time:
             perf_counter.set_warmup_end_time(warmup_end_time.timestamp())
             logger.info("=" * 80)
             logger.info("Warmup period: %s seconds (Avg TPS will be calculated after warmup)", warmup_seconds)
@@ -3284,7 +3339,8 @@ class MultiDBLoadTester:
 
         # 최종 통계 출력
         self._print_final_stats(thread_count, duration_seconds, total_transactions, mode,
-                                warmup_seconds, target_tps, batch_size)
+                                warmup_seconds, target_tps, batch_size,
+                                now, warmup_end_time, end_time)
 
         # 결과 내보내기
         if output_format and output_file:
@@ -3294,15 +3350,20 @@ class MultiDBLoadTester:
 
     def _print_final_stats(self, thread_count: int, duration_seconds: int,
                            total_transactions: int, mode: str,
-                           warmup_seconds: int, target_tps: int, batch_size: int):
+                           warmup_seconds: int, target_tps: int, batch_size: int,
+                           start_time: datetime, warmup_end_time: Optional[datetime], end_time: datetime):
         """최종 통계 출력"""
+        if not perf_counter:
+            return
         final_stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
 
         avg_tps_value = final_stats['post_warmup_tps'] if warmup_seconds > 0 else final_stats['avg_tps']
 
         console_formatter_backup = console_handler.formatter
+        file_formatter_backup = file_handler.formatter
         console_handler.setFormatter(logging.Formatter('%(message)s'))
+        file_handler.setFormatter(logging.Formatter('%(message)s'))
         try:
             logger.info("=" * 80)
             logger.info("LOAD TEST COMPLETED (Python)")
@@ -3316,6 +3377,12 @@ class MultiDBLoadTester:
             logger.info(f"  - Warmup: {warmup_seconds}s")
             logger.info(f"  - Target TPS: {target_tps}")
             logger.info(f"  - Batch Size: {batch_size}")
+            logger.info(f"  - Start Time (Warmup): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            if warmup_end_time:
+                logger.info(f"  - Start Time (Running): {warmup_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                logger.info(f"  - Start Time (Running): {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"  - End Time (Running): {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info("-" * 80)
             logger.info("Results:")
             logger.info(f"  - Total Transactions: {final_stats['total_transactions']:,}")
@@ -3343,10 +3410,13 @@ class MultiDBLoadTester:
             logger.info("=" * 80)
         finally:
             console_handler.setFormatter(console_formatter_backup)
+            file_handler.setFormatter(file_formatter_backup)
 
     def _export_results(self, output_format: str, output_file: str,
                         thread_count: int, duration_seconds: int, mode: str):
         """결과 내보내기"""
+        if not perf_counter:
+            return
         stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
         time_series = perf_counter.time_series

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(del \"e:\\\\DSDrive\\\\CodingVibe\\\\GitHub\\\\Multidb-Workload-Testing\\\\nul\")"
+    ]
+  }
+}
