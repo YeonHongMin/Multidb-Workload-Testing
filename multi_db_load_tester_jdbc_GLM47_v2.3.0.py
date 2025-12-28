@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.2
+멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.3
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 
 특징:
@@ -86,7 +86,21 @@ console_formatter = logging.Formatter(console_format, datefmt='%H:%M:%S')
 
 
 class BelowWarningFilter(logging.Filter):
+    """WARNING 레벨 미만의 로그만 통과시키는 필터
+
+    INFO, DEBUG 레벨 로그를 콘솔에 출력하고,
+    WARNING 이상은 별도 에러 로그 파일로 분리하기 위해 사용
+    """
+
     def filter(self, record: logging.LogRecord) -> bool:
+        """로그 레코드 필터링
+
+        Args:
+            record: 로그 레코드 객체
+
+        Returns:
+            WARNING 레벨 미만이면 True, 그렇지 않으면 False
+        """
         return record.levelno < logging.WARNING
 
 file_handler = logging.FileHandler('multi_db_load_test_jdbc.log')
@@ -125,9 +139,14 @@ class WorkMode:
 # Graceful Shutdown Handler
 # ============================================================================
 class GracefulShutdown:
-    """Graceful Shutdown 핸들러"""
+    """우아한 종료(Graceful Shutdown) 핸들러"""
 
     def __init__(self):
+        """GracefulShutdown 초기화
+
+        SIGINT(Ctrl+C), SIGTERM 시그널 핸들러를 등록하여
+        프로세스 종료 요청 시 현재 진행 중인 트랜잭션을 완료한 후 종료
+        """
         self.shutdown_requested = False
         self.lock = threading.Lock()
 
@@ -136,16 +155,31 @@ class GracefulShutdown:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
+        """시그널 핸들러 콜백
+
+        Args:
+            signum: 수신된 시그널 번호
+            frame: 현재 스택 프레임
+        """
         with self.lock:
             if not self.shutdown_requested:
                 self.shutdown_requested = True
-                logger.info("\n[Shutdown] Graceful shutdown requested. Finishing current transactions...")
+                logger.info("\n[Shutdown] 우아한 종료 요청됨. 현재 트랜잭션 완료 중...")
 
     def is_shutdown_requested(self) -> bool:
+        """종료 요청 여부 확인
+
+        Returns:
+            종료가 요청되었으면 True, 그렇지 않으면 False
+        """
         with self.lock:
             return self.shutdown_requested
 
     def request_shutdown(self):
+        """프로그래밍 방식으로 종료 요청
+
+        시그널이 아닌 코드에서 직접 종료를 요청할 때 사용
+        """
         with self.lock:
             self.shutdown_requested = True
 
@@ -161,6 +195,11 @@ class PerformanceCounter:
     """스레드 안전 성능 카운터 - 1초 이내 측정 지원"""
 
     def __init__(self, sub_second_window_ms: int = 100):
+        """PerformanceCounter 초기화
+
+        Args:
+            sub_second_window_ms: 실시간 TPS 측정 윈도우 크기 (밀리초, 기본 100ms)
+        """
         self.lock = threading.Lock()
         self.total_inserts = 0
         self.total_selects = 0
@@ -238,35 +277,50 @@ class PerformanceCounter:
                 self.latencies.append(latency_ms)
 
     def increment_insert(self, count: int = 1):
+        """INSERT 카운터 증가
+
+        Args:
+            count: 증가시킬 값 (배치 INSERT 시 배치 크기)
+        """
         with self.lock:
             self.total_inserts += count
 
     def increment_select(self):
+        """SELECT 카운터 1 증가"""
         with self.lock:
             self.total_selects += 1
 
     def increment_update(self):
+        """UPDATE 카운터 1 증가"""
         with self.lock:
             self.total_updates += 1
 
     def increment_delete(self):
+        """DELETE 카운터 1 증가"""
         with self.lock:
             self.total_deletes += 1
 
     def increment_error(self):
+        """에러 카운터 1 증가"""
         with self.lock:
             self.total_errors += 1
 
     def increment_verification_failure(self):
+        """검증 실패 카운터 1 증가 (INSERT 후 SELECT 검증 실패 시)"""
         with self.lock:
             self.verification_failures += 1
 
     def increment_connection_recreate(self):
+        """커넥션 재생성 카운터 1 증가 (손상된 커넥션 교체 시)"""
         with self.lock:
             self.connection_recreates += 1
 
     def get_sub_second_tps(self) -> float:
-        """최근 1초간의 TPS"""
+        """최근 1초간의 TPS (실시간 처리량)
+
+        Returns:
+            최근 1초간 완료된 트랜잭션 수
+        """
         current_time = time.time()
 
         with self.recent_lock:
@@ -278,7 +332,14 @@ class PerformanceCounter:
         return float(count)
 
     def get_windowed_tps(self, window_ms: int = None) -> float:
-        """지정된 윈도우 내 TPS"""
+        """지정된 윈도우 내 TPS (지정된 시간 범위의 평균 처리량)
+
+        Args:
+            window_ms: 측정 윈도우 크기 (밀리초, None이면 기본값 사용)
+
+        Returns:
+            지정된 윈도우 내 초당 트랜잭션 수
+        """
         if window_ms is None:
             window_ms = self.sub_second_window_ms
 
@@ -292,7 +353,11 @@ class PerformanceCounter:
         return count / window_sec if window_sec > 0 else 0.0
 
     def get_latency_stats(self) -> Dict[str, float]:
-        """레이턴시 통계"""
+        """레이턴시 통계 조회
+
+        Returns:
+            avg, p50, p95, p99, min, max 값을 포함한 딕셔너리
+        """
         with self.latency_lock:
             if not self.latencies:
                 return {'avg': 0, 'p50': 0, 'p95': 0, 'p99': 0, 'min': 0, 'max': 0}
@@ -310,7 +375,14 @@ class PerformanceCounter:
             }
 
     def get_interval_stats(self) -> Dict[str, Any]:
-        """구간별 통계"""
+        """이전 호출 이후의 구간별 통계 조회
+
+        마지막 호출 시점부터 현재까지의 트랜잭션, INSERT, SELECT 등 통계를 반환
+        호출 시 내부 상태가 갱신되어 다음 호출 시 새로운 구간 통계 제공
+
+        Returns:
+            interval_seconds, interval_transactions, interval_tps 등을 포함한 딕셔너리
+        """
         current_time = time.time()
 
         with self.lock:
@@ -344,7 +416,14 @@ class PerformanceCounter:
             }
 
     def record_time_series(self, pool_stats: Dict[str, int] = None):
-        """시계열 데이터 기록"""
+        """시계열 데이터 기록
+
+        주기적으로 호출되어 현재 성능 지표를 시계열 리스트에 저장
+        CSV/JSON 결과 내보내기 시 사용됨
+
+        Args:
+            pool_stats: 커넥션 풀 상태 딕셔너리 (옵션)
+        """
         current_time = time.time()
         stats = self.get_stats()
         latency_stats = self.get_latency_stats()
@@ -374,7 +453,13 @@ class PerformanceCounter:
             self.time_series.append(record)
 
     def get_stats(self) -> Dict[str, Any]:
-        """전체 통계"""
+        """전체 성능 통계 조회
+
+        테스트 시작부터 현재까지의 누적 통계를 반환
+
+        Returns:
+            total_inserts, total_transactions, avg_tps, realtime_tps 등을 포함한 딕셔너리
+        """
         with self.lock:
             elapsed_time = time.time() - self.start_time
             avg_tps = self.total_transactions / elapsed_time if elapsed_time > 0 else 0
@@ -410,9 +495,14 @@ perf_counter: Optional[PerformanceCounter] = None
 # Rate Limiter (Token Bucket Algorithm)
 # ============================================================================
 class RateLimiter:
-    """Token Bucket 기반 Rate Limiter"""
+    """Token Bucket 기반 Rate Limiter (속도 제한)"""
 
     def __init__(self, target_tps: int):
+        """RateLimiter 초기화
+
+        Args:
+            target_tps: 목표 초당 트랜잭션 수 (0 이하면 비활성화)
+        """
         self.target_tps = target_tps
         self.tokens = target_tps
         self.max_tokens = target_tps * 2  # 버스트 허용
@@ -425,7 +515,17 @@ class RateLimiter:
             self.enabled = True
 
     def acquire(self, timeout: float = 1.0) -> bool:
-        """토큰 획득 (Rate Limiting)"""
+        """토큰 획득 시도 (속도 제한)
+
+        Token Bucket 알고리즘을 사용하여 TPS를 제한합니다.
+        토큰이 있으면 즉시 반환, 없으면 타임아웃까지 대기합니다.
+
+        Args:
+            timeout: 토큰 획득 최대 대기 시간 (초)
+
+        Returns:
+            토큰 획득 성공 시 True, 타임아웃 시 False
+        """
         if not self.enabled:
             return True
 
@@ -456,12 +556,19 @@ class RateLimiter:
 # 결과 내보내기
 # ============================================================================
 class ResultExporter:
-    """테스트 결과 내보내기"""
+    """테스트 결과 내보내기 유틸리티"""
 
     @staticmethod
     def export_csv(filepath: str, stats: Dict[str, Any], time_series: List[Dict],
                    config: Dict[str, Any]):
-        """CSV 형식으로 내보내기"""
+        """테스트 결과를 CSV 형식으로 내보내기
+
+        Args:
+            filepath: 저장할 파일 경로
+            stats: 최종 성능 통계 딕셔너리
+            time_series: 시계열 데이터 리스트
+            config: 테스트 설정 딕셔너리
+        """
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
 
@@ -490,7 +597,15 @@ class ResultExporter:
     @staticmethod
     def export_json(filepath: str, stats: Dict[str, Any], time_series: List[Dict],
                     config: Dict[str, Any], latency_stats: Dict[str, float]):
-        """JSON 형식으로 내보내기"""
+        """테스트 결과를 JSON 형식으로 내보내기
+
+        Args:
+            filepath: 저장할 파일 경로
+            stats: 최종 성능 통계 딕셔너리
+            time_series: 시계열 데이터 리스트
+            config: 테스트 설정 딕셔너리
+            latency_stats: 레이턴시 통계 딕셔너리
+        """
         result = {
             'test_info': {
                 'timestamp': datetime.now().isoformat(),
@@ -554,7 +669,17 @@ JDBC_DRIVERS = {
 
 
 def get_jvm_path() -> str:
-    """크로스 플랫폼 JVM 경로 찾기"""
+    """크로스 플랫폼 JVM 경로 찾기
+
+    Windows, macOS, Linux 환경에서 JVM 라이브러리 경로를 자동 탐지합니다.
+    JAVA_HOME 환경 변수가 설정된 경우 우선 사용합니다.
+
+    Returns:
+        JVM 라이브러리 경로 (jvm.dll, libjvm.dylib, libjvm.so)
+
+    Raises:
+        RuntimeError: JVM을 찾을 수 없는 경우
+    """
     system = platform.system().lower()
     java_home = os.environ.get('JAVA_HOME', '')
 
@@ -588,7 +713,15 @@ def get_jvm_path() -> str:
 
 
 def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
-    """JVM 초기화"""
+    """JVM 초기화 및 JDBC 드라이버 로드
+
+    지정된 디렉터리의 모든 JAR 파일을 클래스패스에 추가하고 JVM을 시작합니다.
+    이미 JVM이 시작된 경우에는 아무 동작도 하지 않습니다.
+
+    Args:
+        jre_dir: JDBC 드라이버 JAR 파일이 있는 디렉터리 경로
+        extra_args: 추가 JVM 인자 리스트 (옵션)
+    """
     if jpype.isJVMStarted():
         return
 
@@ -624,7 +757,21 @@ def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
 
 
 def find_jdbc_jar(db_type: str, jre_dir: str = './jre') -> Optional[str]:
-    """JDBC JAR 파일 찾기"""
+    """데이터베이스 타입에 맞는 JDBC JAR 파일 찾기
+
+    DB별 서브디렉터리(예: ./jre/oracle/)를 먼저 검색하고,
+    없으면 전체 디렉터리를 재귀 검색합니다.
+
+    Args:
+        db_type: 데이터베이스 타입 (oracle, postgresql, mysql 등)
+        jre_dir: JDBC 드라이버 JAR 파일이 있는 디렉터리 경로
+
+    Returns:
+        JDBC JAR 파일 경로, 찾지 못한 경우 None
+
+    Raises:
+        ValueError: 지원하지 않는 DB 타입인 경우
+    """
     if db_type not in JDBC_DRIVERS:
         raise ValueError(f"Unsupported DB type: {db_type}")
 
@@ -652,7 +799,7 @@ def find_jdbc_jar(db_type: str, jre_dir: str = './jre') -> Optional[str]:
 
 
 # ============================================================================
-# JDBC 커넥션 풀 - Enhanced with Monitoring, Leak Detection, Health Check
+# 커넥션 풀 (Connection Pool) - Enhanced with Monitoring, Leak Detection, Health Check
 # ============================================================================
 @dataclass
 class PooledConnection:
@@ -664,29 +811,56 @@ class PooledConnection:
     last_used_at: float = field(default_factory=time.time)
 
     def mark_acquired(self, thread_name: str = None):
-        """커넥션 획득 시 호출"""
+        """커넥션 획득 시 호출
+
+        Leak 감지를 위해 획득 시간 및 스레드 정보를 기록합니다.
+
+        Args:
+            thread_name: 커넥션을 획득한 스레드 이름 (옵션)
+        """
         self.acquired_at = time.time()
         self.acquired_by = thread_name or threading.current_thread().name
         self.last_used_at = self.acquired_at
 
     def mark_released(self):
-        """커넥션 반환 시 호출"""
+        """커넥션 반환 시 호출
+
+        획득 정보를 초기화하고 마지막 사용 시간을 갱신합니다.
+        """
         self.acquired_at = None
         self.acquired_by = None
         self.last_used_at = time.time()
 
     def get_age_seconds(self) -> float:
-        """커넥션 생성 후 경과 시간 (초)"""
+        """커넥션 생성 후 경과 시간 (초)
+
+        Max Lifetime 검사에 사용됩니다.
+
+        Returns:
+            커넥션 생성 후 경과한 초
+        """
         return time.time() - self.created_at
 
     def get_acquired_duration_seconds(self) -> Optional[float]:
-        """커넥션 획득 후 경과 시간 (초)"""
+        """커넥션 획득 후 경과 시간 (초)
+
+        Leak 감지에 사용됩니다. 임계값을 초과하면 경고를 발생시킵니다.
+
+        Returns:
+            획득 후 경과한 초, 미획득 상태면 None
+        """
         if self.acquired_at is None:
             return None
         return time.time() - self.acquired_at
 
     def get_idle_seconds(self) -> Optional[float]:
-        """커넥션 유휴 시간 (초)"""
+        """커넥션 유휴 시간 (초)
+
+        유휴 커넥션 Health Check에 사용됩니다.
+
+        Returns:
+            유휴 시간 (초), 사용 중이면 None
+        """
         if self.acquired_at is not None:
             return None
         return time.time() - self.last_used_at
@@ -782,7 +956,11 @@ class JDBCConnectionPool:
         self._warmup_pool()
 
     def _warmup_pool(self):
-        """Pool Warm-up: 초기화 시 min_size만큼 커넥션 미리 생성"""
+        """풀 웜업: 초기화 시 min_size만큼 커넥션 미리 생성
+
+        테스트 시작 전에 커넥션을 미리 생성하여 초기 지연을 방지합니다.
+        Health Check 스레드도 함께 시작됩니다.
+        """
         logger.info(f"[Pool Warm-up] Creating {self.min_size} initial connections...")
         created = 0
         for i in range(self.min_size):
@@ -872,7 +1050,13 @@ class JDBCConnectionPool:
         return None
 
     def _create_connection(self):
-        """새 커넥션 생성 (하위 호환성 유지)"""
+        """새 커넥션 생성 (하위 호환성 유지)
+
+        _create_connection_internal을 호출하고 생성된 커넥션을 풀에 추가합니다.
+
+        Returns:
+            생성된 커넥션 객체, 실패 시 None
+        """
         pooled_conn = self._create_connection_internal()
         if pooled_conn:
             self.pool.put(pooled_conn)
@@ -880,7 +1064,16 @@ class JDBCConnectionPool:
         return None
 
     def _validate_connection(self, conn) -> bool:
-        """커넥션 유효성 검증"""
+        """커넥션 유효성 검증
+
+        JDBC isValid() 메서드를 사용하여 커넥션이 유효한지 확인합니다.
+
+        Args:
+            conn: 검증할 커넥션 (PooledConnection 또는 raw connection)
+
+        Returns:
+            유효하면 True, 그렇지 않으면 False
+        """
         try:
             if conn is None:
                 return False
@@ -896,11 +1089,21 @@ class JDBCConnectionPool:
             return False
 
     def _is_connection_expired(self, pooled_conn: PooledConnection) -> bool:
-        """커넥션이 max_lifetime을 초과했는지 확인"""
+        """커넥션이 max_lifetime을 초과했는지 확인
+
+        Args:
+            pooled_conn: 검사할 PooledConnection
+
+        Returns:
+            만료되었으면 True, 그렇지 않으면 False
+        """
         return pooled_conn.get_age_seconds() > self.max_lifetime_seconds
 
     def _start_health_check_thread(self):
-        """Health Check 스레드 시작"""
+        """Health Check 스레드 시작
+
+        유휴 커넥션 검증 및 Leak 감지를 위한 백그라운드 스레드를 시작합니다.
+        """
         if self._health_check_thread is not None and self._health_check_thread.is_alive():
             return
 
@@ -914,7 +1117,11 @@ class JDBCConnectionPool:
         logger.info("[Health Check] Thread started")
 
     def _health_check_loop(self):
-        """Health Check 메인 루프"""
+        """Health Check 메인 루프
+
+        주기적으로 유휴 커넥션 검증 및 Leak 감지를 수행합니다.
+        풀 종료 시 자동으로 중단됩니다.
+        """
         while self._health_check_running:
             try:
                 time.sleep(self.idle_check_interval_seconds)
@@ -927,7 +1134,14 @@ class JDBCConnectionPool:
                 logger.error(f"[Health Check] Error: {e}")
 
     def _check_idle_connections(self):
-        """Idle connection health check and cleanup."""
+        """유휴 커넥션 Health Check 및 정리
+
+        풀의 모든 유휴 커넥션을 검사하여:
+        1. Max Lifetime 초과 커넥션 재생성
+        2. Idle Timeout 초과 커넥션 제거 (min_size 유지)
+        3. Keepalive 시간 초과 커넥션 유효성 검사
+        4. 무효한 커넥션 제거 및 min_size 유지를 위한 새 커넥션 생성
+        """
         checked = 0
         removed = 0
         recycled = 0
@@ -1006,7 +1220,11 @@ class JDBCConnectionPool:
             logger.info(f"[Health Check] Checked: {checked}, Removed: {removed}, Recycled: {recycled}")
 
     def _detect_connection_leaks(self):
-        """Connection Leak 감지"""
+        """커넥션 Leak 감지
+
+        획득된 상태로 임계 시간을 초과한 커넥션을 탐지하여 경고 로그를 출력합니다.
+        Leak된 커넥션은 자동으로 회수되지 않으며, 경고만 발생시킵니다.
+        """
         leaked_connections = []
 
         with self.active_connections_lock:
@@ -1028,7 +1246,11 @@ class JDBCConnectionPool:
             )
 
     def _close_pooled_connection(self, pooled_conn: PooledConnection):
-        """PooledConnection 종료"""
+        """PooledConnection 종료 및 풀 크기 감소
+
+        Args:
+            pooled_conn: 종료할 PooledConnection
+        """
         try:
             if pooled_conn and pooled_conn.connection:
                 pooled_conn.connection.close()
@@ -1038,7 +1260,13 @@ class JDBCConnectionPool:
             self.current_size = max(0, self.current_size - 1)
 
     def get_pool_stats(self) -> Dict[str, int]:
-        """풀 상태 조회 (Non-blocking)"""
+        """풀 상태 조회 (Non-blocking)
+
+        모니터링 스레드가 락 대기로 멈추지 않도록 타임아웃을 적용합니다.
+
+        Returns:
+            pool_total, pool_active, pool_idle 등을 포함한 딕셔너리
+        """
         # Monitor thread shouldn't hang on lock
         if not self.lock.acquire(timeout=0.1):
              # If cannot acquire lock, return estimated or cached values (or just zeros/current state without lock)
@@ -1185,7 +1413,14 @@ class JDBCConnectionPool:
         return None
 
     def release(self, conn):
-        """커넥션 반환"""
+        """커넥션 반환
+
+        사용 완료된 커넥션을 풀에 반환합니다.
+        Max Lifetime 초과 시 자동으로 재생성하고, 무효한 커넥션은 폐기합니다.
+
+        Args:
+            conn: 반환할 커넥션
+        """
         if conn is None:
             return
 
@@ -1228,7 +1463,13 @@ class JDBCConnectionPool:
             self._close_pooled_connection(pooled_conn)
 
     def discard(self, conn):
-        """커넥션 폐기"""
+        """커넥션 폐기 (풀에 반환하지 않고 종료)
+
+        에러 발생 등으로 인해 재사용이 불가능한 커넥션을 폐기합니다.
+
+        Args:
+            conn: 폐기할 커넥션
+        """
         if conn is None:
             return
 
@@ -1250,7 +1491,11 @@ class JDBCConnectionPool:
             self.current_size = max(0, self.current_size - 1)
 
     def close_all(self):
-        """모든 커넥션 종료"""
+        """모든 커넥션 종료 및 풀 정리
+
+        테스트 종료 시 호출되어 Health Check 스레드를 중지하고
+        풀과 활성 커넥션을 모두 정리합니다.
+        """
         logger.info("Closing all connections in pool...")
 
         # Health Check 스레드 중지
@@ -1282,81 +1527,104 @@ class JDBCConnectionPool:
 # 데이터베이스 어댑터 인터페이스
 # ============================================================================
 class DatabaseAdapter(ABC):
-    """데이터베이스 공통 인터페이스"""
+    """데이터베이스 공통 인터페이스
+
+    각 데이터베이스별 어댑터가 구현해야 하는 추상 메서드들을 정의합니다.
+    Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2 등을 지원합니다.
+    """
 
     def __init__(self):
+        """DatabaseAdapter 기본 초기화"""
         self.validation_timeout = 2
 
     @abstractmethod
     def create_connection_pool(self, config: 'DatabaseConfig'):
+        """커넥션 풀 생성"""
         pass
 
     @abstractmethod
     def get_connection(self):
+        """풀에서 커넥션 획득"""
         pass
 
     @abstractmethod
     def release_connection(self, connection, is_error: bool = False):
+        """커넥션 반환 (에러 시 롤백 후 반환)"""
         pass
 
     @abstractmethod
     def discard_connection(self, connection):
+        """손상된 커넥션 폐기"""
         pass
 
     @abstractmethod
     def close_pool(self):
+        """커넥션 풀 종료"""
         pass
 
     @abstractmethod
     def get_pool_stats(self) -> Dict[str, int]:
+        """커넥션 풀 상태 조회"""
         pass
 
     @abstractmethod
     def execute_insert(self, cursor, thread_id: str, random_data: str) -> int:
+        """단일 INSERT 실행 및 생성된 ID 반환"""
         pass
 
     @abstractmethod
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행 및 삽입 건수 반환"""
         pass
 
     @abstractmethod
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """ID로 레코드 조회"""
         pass
 
     @abstractmethod
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회"""
         pass
 
     @abstractmethod
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행"""
         pass
 
     @abstractmethod
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행"""
         pass
 
     @abstractmethod
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회"""
         pass
 
     @abstractmethod
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성"""
         pass
 
     @abstractmethod
     def commit(self, connection):
+        """트랜잭션 커밋"""
         pass
 
     @abstractmethod
     def rollback(self, connection):
+        """트랜잭션 롤백"""
         pass
 
     @abstractmethod
     def get_ddl(self) -> str:
+        """테이블 생성 DDL 반환"""
         pass
 
     @abstractmethod
     def setup_schema(self, connection):
+        """테스트 스키마 생성"""
         pass
 
 
@@ -1364,9 +1632,21 @@ class DatabaseAdapter(ABC):
 # Oracle JDBC 어댑터
 # ============================================================================
 class OracleJDBCAdapter(DatabaseAdapter):
-    """Oracle JDBC 어댑터"""
+    """Oracle JDBC 어댑터
+
+    Oracle 데이터베이스에 JDBC를 통해 연결하고 SQL을 실행합니다.
+    SID 또는 Service Name 연결 방식을 모두 지원합니다.
+    """
 
     def __init__(self, jre_dir: str = './jre'):
+        """OracleJDBCAdapter 초기화
+
+        Args:
+            jre_dir: JDBC 드라이버 JAR 파일이 있는 디렉터리
+
+        Raises:
+            RuntimeError: Oracle JDBC 드라이버를 찾을 수 없는 경우
+        """
         self.pool = None
         self.jar_file = find_jdbc_jar('oracle', jre_dir)
         if not self.jar_file:
@@ -1577,6 +1857,14 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 시퀀스 초기화
+
+        LOAD_TEST 테이블의 모든 데이터를 삭제하고
+        LOAD_TEST_SEQ 시퀀스를 1부터 다시 시작합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE LOAD_TEST")
@@ -1595,7 +1883,11 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
 # PostgreSQL JDBC 어댑터
 # ============================================================================
 class PostgreSQLJDBCAdapter(DatabaseAdapter):
-    """PostgreSQL JDBC 어댑터"""
+    """PostgreSQL JDBC 어댑터
+
+    PostgreSQL 데이터베이스에 JDBC를 통해 연결하고 SQL을 실행합니다.
+    BIGSERIAL 컬럼과 RETURNING 절을 사용하여 자동 증가 ID를 관리합니다.
+    """
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -1651,6 +1943,18 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행
+
+        지정된 크기만큼 INSERT 문을 반복 실행하여 대량 삽입을 수행합니다.
+
+        Args:
+            cursor: 데이터베이스 커서
+            thread_id: 워커 스레드 식별자
+            batch_size: 배치 크기 (삽입할 레코드 수)
+
+        Returns:
+            삽입된 레코드 수 (batch_size)
+        """
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
         for _ in range(batch_size):
             cursor.execute("""
@@ -1660,10 +1964,28 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """단일 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 조회할 레코드 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         if max_id <= 0:
             return None
         random_id = random.randint(1, max_id)
@@ -1671,26 +1993,71 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 업데이트할 레코드 ID
+
+        Returns:
+            업데이트 성공 시 True, 실패 시 False
+        """
         cursor.execute("UPDATE load_test SET value_col = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                        [f'UPDATED_{record_id}', record_id])
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 삭제할 레코드 ID
+
+        Returns:
+            삭제 성공 시 True, 실패 시 False
+        """
         cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+
+        Returns:
+            최대 ID 값, 레코드가 없으면 0
+        """
         cursor.execute("SELECT COALESCE(MAX(id), 0) FROM load_test")
         result = cursor.fetchone()
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성
+
+        Args:
+            cursor: 데이터베이스 커서 (미사용)
+            max_id: 최대 ID 범위
+
+        Returns:
+            1과 max_id 사이의 랜덤 정수
+        """
         return random.randint(1, max_id) if max_id > 0 else 0
 
     def commit(self, connection):
+        """트랜잭션 커밋
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         connection.commit()
 
     def rollback(self, connection):
+        """트랜잭션 롤백
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         try:
             connection.rollback()
         except:
@@ -1744,6 +2111,14 @@ CREATE TABLE load_test (
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 시퀀스 초기화
+
+        load_test 테이블의 모든 데이터를 삭제하고
+        IDENTITY 시퀀스를 1부터 다시 시작합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE load_test RESTART IDENTITY")
@@ -1850,6 +2225,18 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행
+
+        지정된 크기만큼 INSERT 문을 반복 실행하여 대량 삽입을 수행합니다.
+
+        Args:
+            cursor: 데이터베이스 커서
+            thread_id: 워커 스레드 식별자
+            batch_size: 배치 크기 (삽입할 레코드 수)
+
+        Returns:
+            삽입된 레코드 수 (batch_size)
+        """
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
         for _ in range(batch_size):
             cursor.execute("""
@@ -1859,10 +2246,28 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """단일 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 조회할 레코드 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         if max_id <= 0:
             return None
         random_id = random.randint(1, max_id)
@@ -1870,31 +2275,81 @@ class MySQLJDBCAdapter(DatabaseAdapter):
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 업데이트할 레코드 ID
+
+        Returns:
+            업데이트 성공 시 True, 실패 시 False
+        """
         cursor.execute("UPDATE load_test SET value_col = ? WHERE id = ?", [f'UPDATED_{record_id}', record_id])
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 삭제할 레코드 ID
+
+        Returns:
+            삭제 성공 시 True, 실패 시 False
+        """
         cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+
+        Returns:
+            최대 ID 값, 레코드가 없으면 0
+        """
         cursor.execute("SELECT IFNULL(MAX(id), 0) FROM load_test")
         result = cursor.fetchone()
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성
+
+        Args:
+            cursor: 데이터베이스 커서 (미사용)
+            max_id: 최대 ID 범위
+
+        Returns:
+            1과 max_id 사이의 랜덤 정수
+        """
         return random.randint(1, max_id) if max_id > 0 else 0
 
     def commit(self, connection):
+        """트랜잭션 커밋
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         connection.commit()
 
     def rollback(self, connection):
+        """트랜잭션 롤백
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         try:
             connection.rollback()
         except:
             pass
 
     def get_ddl(self) -> str:
+        """테이블 생성 DDL 반환
+
+        Returns:
+            MySQL용 테이블 생성 SQL 문자열
+        """
         return """
 -- MySQL DDL
 CREATE TABLE load_test (
@@ -1939,6 +2394,14 @@ CREATE TABLE load_test (
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 AUTO_INCREMENT 초기화
+
+        load_test 테이블의 모든 데이터를 삭제하고
+        AUTO_INCREMENT를 1부터 다시 시작합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE load_test")
@@ -1955,7 +2418,11 @@ CREATE TABLE load_test (
 # SQL Server JDBC 어댑터
 # ============================================================================
 class SQLServerJDBCAdapter(DatabaseAdapter):
-    """SQL Server JDBC 어댑터"""
+    """SQL Server JDBC 어댑터
+
+    Microsoft SQL Server 데이터베이스에 JDBC를 통해 연결하고 SQL을 실행합니다.
+    IDENTITY 컬럼과 SCOPE_IDENTITY() 함수를 사용하여 자동 증가 ID를 관리합니다.
+    """
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -2012,6 +2479,18 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행
+
+        지정된 크기만큼 INSERT 문을 반복 실행하여 대량 삽입을 수행합니다.
+
+        Args:
+            cursor: 데이터베이스 커서
+            thread_id: 워커 스레드 식별자
+            batch_size: 배치 크기 (삽입할 레코드 수)
+
+        Returns:
+            삽입된 레코드 수 (batch_size)
+        """
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
         for _ in range(batch_size):
             cursor.execute("""
@@ -2021,10 +2500,28 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """단일 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 조회할 레코드 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         cursor.execute("SELECT id, thread_id, value_col FROM load_test WHERE id = ?", [record_id])
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         if max_id <= 0:
             return None
         random_id = random.randint(1, max_id)
@@ -2032,32 +2529,82 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 업데이트할 레코드 ID
+
+        Returns:
+            업데이트 성공 시 True, 실패 시 False
+        """
         cursor.execute("UPDATE load_test SET value_col = ?, updated_at = GETDATE() WHERE id = ?",
                        [f'UPDATED_{record_id}', record_id])
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 삭제할 레코드 ID
+
+        Returns:
+            삭제 성공 시 True, 실패 시 False
+        """
         cursor.execute("DELETE FROM load_test WHERE id = ?", [record_id])
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+
+        Returns:
+            최대 ID 값, 레코드가 없으면 0
+        """
         cursor.execute("SELECT ISNULL(MAX(id), 0) FROM load_test")
         result = cursor.fetchone()
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성
+
+        Args:
+            cursor: 데이터베이스 커서 (미사용)
+            max_id: 최대 ID 범위
+
+        Returns:
+            1과 max_id 사이의 랜덤 정수
+        """
         return random.randint(1, max_id) if max_id > 0 else 0
 
     def commit(self, connection):
+        """트랜잭션 커밋
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         connection.commit()
 
     def rollback(self, connection):
+        """트랜잭션 롤백
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         try:
             connection.rollback()
         except:
             pass
 
     def get_ddl(self) -> str:
+        """테이블 생성 DDL 반환
+
+        Returns:
+            SQL Server용 테이블 생성 SQL 문자열
+        """
         return """
 -- SQL Server DDL
 CREATE TABLE load_test (
@@ -2100,6 +2647,14 @@ CREATE TABLE load_test (
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 IDENTITY 초기화
+
+        load_test 테이블의 모든 데이터를 삭제하고
+        IDENTITY를 1부터 다시 시작합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE load_test")
@@ -2116,7 +2671,11 @@ CREATE TABLE load_test (
 # Tibero JDBC 어댑터
 # ============================================================================
 class TiberoJDBCAdapter(DatabaseAdapter):
-    """Tibero JDBC 어댑터"""
+    """Tibero JDBC 어댑터
+
+    Tibero 데이터베이스에 JDBC를 통해 연결하고 SQL을 실행합니다.
+    Oracle과 호환되는 시퀀스(LOAD_TEST_SEQ)와 SYSTIMESTAMP를 사용합니다.
+    """
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -2173,6 +2732,18 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         return int(result[0])
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행
+
+        지정된 크기만큼 INSERT 문을 반복 실행하여 대량 삽입을 수행합니다.
+
+        Args:
+            cursor: 데이터베이스 커서
+            thread_id: 워커 스레드 식별자
+            batch_size: 배치 크기 (삽입할 레코드 수)
+
+        Returns:
+            삽입된 레코드 수 (batch_size)
+        """
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
         for _ in range(batch_size):
             cursor.execute("""
@@ -2182,10 +2753,28 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """단일 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 조회할 레코드 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         if max_id <= 0:
             return None
         random_id = random.randint(1, max_id)
@@ -2193,32 +2782,82 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 업데이트할 레코드 ID
+
+        Returns:
+            업데이트 성공 시 True, 실패 시 False
+        """
         cursor.execute("UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = SYSTIMESTAMP WHERE ID = ?",
                        [f'UPDATED_{record_id}', record_id])
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 삭제할 레코드 ID
+
+        Returns:
+            삭제 성공 시 True, 실패 시 False
+        """
         cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+
+        Returns:
+            최대 ID 값, 레코드가 없으면 0
+        """
         cursor.execute("SELECT NVL(MAX(ID), 0) FROM LOAD_TEST")
         result = cursor.fetchone()
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성
+
+        Args:
+            cursor: 데이터베이스 커서 (미사용)
+            max_id: 최대 ID 범위
+
+        Returns:
+            1과 max_id 사이의 랜덤 정수
+        """
         return random.randint(1, max_id) if max_id > 0 else 0
 
     def commit(self, connection):
+        """트랜잭션 커밋
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         connection.commit()
 
     def rollback(self, connection):
+        """트랜잭션 롤백
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         try:
             connection.rollback()
         except:
             pass
 
     def get_ddl(self) -> str:
+        """테이블 생성 DDL 반환
+
+        Returns:
+            Tibero용 테이블 생성 SQL 문자열
+        """
         return """
 -- Tibero DDL
 CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NOCYCLE ORDER;
@@ -2284,6 +2923,14 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 시퀀스 초기화
+
+        LOAD_TEST 테이블의 모든 데이터를 삭제하고
+        LOAD_TEST_SEQ 시퀀스를 1부터 다시 시작합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE LOAD_TEST")
@@ -2302,7 +2949,10 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 # DB2 JDBC Adapter
 # ============================================================================
 class DB2JDBCAdapter(DatabaseAdapter):
-    """IBM DB2 JDBC adapter"""
+    """IBM DB2 JDBC 어댑터
+
+    IBM DB2 데이터베이스에 JDBC를 통해 연결하고 SQL을 실행합니다.
+    """
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -2360,6 +3010,18 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return int(result[0]) if result else -1
 
     def execute_batch_insert(self, cursor, thread_id: str, batch_size: int) -> int:
+        """배치 INSERT 실행
+
+        지정된 크기만큼 INSERT 문을 반복 실행하여 대량 삽입을 수행합니다.
+
+        Args:
+            cursor: 데이터베이스 커서
+            thread_id: 워커 스레드 식별자
+            batch_size: 배치 크기 (삽입할 레코드 수)
+
+        Returns:
+            삽입된 레코드 수 (batch_size)
+        """
         random_data = ''.join(random.choices(string.ascii_letters + string.digits, k=500))
         for _ in range(batch_size):
             cursor.execute("""
@@ -2369,10 +3031,28 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return batch_size
 
     def execute_select(self, cursor, record_id: int) -> Optional[tuple]:
+        """단일 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 조회할 레코드 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         cursor.execute("SELECT ID, THREAD_ID, VALUE_COL FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.fetchone()
 
     def execute_random_select(self, cursor, max_id: int) -> Optional[tuple]:
+        """랜덤 레코드 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            조회된 레코드 튜플, 없으면 None
+        """
         if max_id <= 0:
             return None
         random_id = random.randint(1, max_id)
@@ -2380,6 +3060,15 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return cursor.fetchone()
 
     def execute_update(self, cursor, record_id: int) -> bool:
+        """레코드 UPDATE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 업데이트할 레코드 ID
+
+        Returns:
+            업데이트 성공 시 True, 실패 시 False
+        """
         cursor.execute(
             "UPDATE LOAD_TEST SET VALUE_COL = ?, UPDATED_AT = CURRENT TIMESTAMP WHERE ID = ?",
             [f'UPDATED_{record_id}', record_id]
@@ -2387,27 +3076,68 @@ class DB2JDBCAdapter(DatabaseAdapter):
         return cursor.rowcount > 0
 
     def execute_delete(self, cursor, record_id: int) -> bool:
+        """레코드 DELETE 실행
+
+        Args:
+            cursor: 데이터베이스 커서
+            record_id: 삭제할 레코드 ID
+
+        Returns:
+            삭제 성공 시 True, 실패 시 False
+        """
         cursor.execute("DELETE FROM LOAD_TEST WHERE ID = ?", [record_id])
         return cursor.rowcount > 0
 
     def get_max_id(self, cursor) -> int:
+        """테이블의 최대 ID 조회
+
+        Args:
+            cursor: 데이터베이스 커서
+
+        Returns:
+            최대 ID 값, 레코드가 없으면 0
+        """
         cursor.execute("SELECT COALESCE(MAX(ID), 0) FROM LOAD_TEST")
         result = cursor.fetchone()
         return int(result[0]) if result else 0
 
     def get_random_id(self, cursor, max_id: int) -> int:
+        """랜덤 ID 생성
+
+        Args:
+            cursor: 데이터베이스 커서 (미사용)
+            max_id: 최대 ID 범위
+
+        Returns:
+            1과 max_id 사이의 랜덤 정수
+        """
         return random.randint(1, max_id) if max_id > 0 else 0
 
     def commit(self, connection):
+        """트랜잭션 커밋
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         connection.commit()
 
     def rollback(self, connection):
+        """트랜잭션 롤백
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         try:
             connection.rollback()
         except:
             pass
 
     def get_ddl(self) -> str:
+        """테이블 생성 DDL 반환
+
+        Returns:
+            DB2용 테이블 생성 SQL 문자열
+        """
         return """
 -- IBM DB2 DDL
 CREATE SEQUENCE LOAD_TEST_SEQ START WITH 1 INCREMENT BY 1 CACHE 1000 NO CYCLE ORDER;
@@ -2481,6 +3211,15 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT);
             cursor.close()
 
     def truncate_table(self, connection):
+        """테이블 데이터 삭제 및 시퀀스 초기화
+
+        LOAD_TEST 테이블의 모든 데이터를 삭제하고
+        LOAD_TEST_SEQ 시퀀스를 1부터 다시 시작합니다.
+        IMMEDIATE 옵션으로 즉시 커밋됩니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+        """
         cursor = connection.cursor()
         try:
             cursor.execute("TRUNCATE TABLE LOAD_TEST IMMEDIATE")
@@ -2495,7 +3234,6 @@ CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT);
             cursor.close()
 
 
-# ============================================================================
 # 설정 클래스
 # ============================================================================
 @dataclass
@@ -2541,7 +3279,17 @@ class DatabaseConfig:
 # 부하 테스트 워커 - Enhanced
 # ============================================================================
 class LoadTestWorker:
-    """부하 테스트 워커 - 전체 기능 지원"""
+    """부하 테스트 워커 - 전체 기능 지원
+
+    각 워커 스레드에서 실행되어 DB 작업을 수행합니다.
+    INSERT, SELECT, UPDATE, DELETE 등 다양한 모드를 지원하며,
+    커넥션 오류 시 자동 재연결 로직을 포함합니다.
+
+    Attributes:
+        ERROR_LOG_INTERVAL_MS: 에러 로그 출력 간격 (밀리초)
+        MAX_CONNECTION_RETRIES: 커넥션 획득 최대 재시도 횟수
+        MAX_BACKOFF_MS: 최대 백오프 시간 (밀리초)
+    """
     ERROR_LOG_INTERVAL_MS = 10000
     MAX_CONNECTION_RETRIES = 3
     MAX_BACKOFF_MS = 5000
@@ -2549,6 +3297,18 @@ class LoadTestWorker:
     def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
                  mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
                  rate_limiter: RateLimiter = None, ramp_up_end_time: datetime = None):
+        """LoadTestWorker 초기화
+
+        Args:
+            worker_id: 워커 식별 번호
+            db_adapter: 데이터베이스 어댑터
+            end_time: 테스트 종료 시간
+            mode: 작업 모드 (full, insert-only, select-only 등)
+            max_id_cache: 기존 데이터의 최대 ID (캐시)
+            batch_size: 배치 INSERT 크기
+            rate_limiter: 속도 제한기 (옵션)
+            ramp_up_end_time: Ramp-up 종료 시간 (옵션)
+        """
         self.worker_id = worker_id
         self.db_adapter = db_adapter
         self.end_time = end_time
@@ -2564,15 +3324,35 @@ class LoadTestWorker:
         self.current_backoff_ms = 100
 
     def generate_random_data(self, length: int = 500) -> str:
+        """테스트용 랜덤 문자열 생성
+
+        Args:
+            length: 생성할 문자열 길이
+
+        Returns:
+            영문자와 숫자로 구성된 랜덤 문자열
+        """
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
     def is_during_ramp_up(self) -> bool:
-        """Ramp-up ???? ??"""
+        """Ramp-up 기간 여부 확인
+
+        Returns:
+            Ramp-up 기간 중이면 True, 그렇지 않으면 False
+        """
         if self.ramp_up_end_time is None:
             return False
         return datetime.now() < self.ramp_up_end_time
 
     def _is_connection_valid(self, connection) -> bool:
+        """커넥션 유효성 검사
+
+        Args:
+            connection: 검사할 커넥션
+
+        Returns:
+            유효하면 True, 그렇지 않으면 False
+        """
         try:
             if connection is None:
                 return False
@@ -2588,6 +3368,14 @@ class LoadTestWorker:
             return False
 
     def _get_valid_connection(self):
+        """유효한 커넥션 획득 (재시도 로직 포함)
+
+        커넥션 풀에서 커넥션을 획득하고 유효성을 검사합니다.
+        무효한 커넥션은 폐기하고 새로운 커넥션을 시도합니다.
+
+        Returns:
+            유효한 커넥션 객체, 모든 재시도 실패 시에도 마지막 시도 결과 반환
+        """
         for retry in range(self.MAX_CONNECTION_RETRIES):
             try:
                 conn = self.db_adapter.get_connection()
@@ -2607,9 +3395,19 @@ class LoadTestWorker:
         return self.db_adapter.get_connection()
 
     def reset_backoff(self):
+        """백오프 시간 초기화 (성공 시 호출)"""
         self.current_backoff_ms = 100
 
     def log_error(self, operation: str, message: str):
+        """에러 로그 기록 (중복 억제)
+
+        동일한 에러가 반복될 때 로그 폭주를 방지하기 위해
+        일정 간격으로만 경고 로그를 출력하고, 그 외에는 디버그 레벨로 기록합니다.
+
+        Args:
+            operation: 수행 중이던 작업 이름
+            message: 에러 메시지
+        """
         # if message and (
         #     'Connection is closed' in message or
         #     'connection is closed' in message or
@@ -2636,6 +3434,14 @@ class LoadTestWorker:
             logger.debug(f"[{self.thread_name}] {operation} error: {message}")
 
     def execute_insert(self, connection) -> bool:
+        """INSERT 작업 실행
+
+        Args:
+            connection: 데이터베이스 커넥션
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2669,6 +3475,15 @@ class LoadTestWorker:
                     pass
 
     def execute_select(self, connection, max_id: int) -> bool:
+        """SELECT 작업 실행
+
+        Args:
+            connection: 데이터베이스 커넥션
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2692,6 +3507,15 @@ class LoadTestWorker:
                     pass
 
     def execute_update(self, connection, max_id: int) -> bool:
+        """UPDATE 작업 실행
+
+        Args:
+            connection: 데이터베이스 커넥션
+            max_id: 업데이트 가능한 최대 ID
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2720,6 +3544,15 @@ class LoadTestWorker:
                     pass
 
     def execute_delete(self, connection, max_id: int) -> bool:
+        """DELETE 작업 실행
+
+        Args:
+            connection: 데이터베이스 커넥션
+            max_id: 삭제 가능한 최대 ID
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2748,7 +3581,18 @@ class LoadTestWorker:
                     pass
 
     def execute_mixed(self, connection, max_id: int) -> bool:
-        """혼합 모드: INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%"""
+        """혼합 모드 작업 실행
+
+        랜덤하게 작업을 선택하여 실행합니다.
+        비율: INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%
+
+        Args:
+            connection: 데이터베이스 커넥션
+            max_id: 작업 가능한 최대 ID
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         rand = random.random()
         if rand < 0.60:
             return self.execute_insert(connection)
@@ -2760,7 +3604,17 @@ class LoadTestWorker:
             return self.execute_delete(connection, max_id)
 
     def execute_full(self, connection) -> bool:
-        """전체 트랜잭션: INSERT -> COMMIT -> SELECT -> VERIFY"""
+        """전체 트랜잭션 실행
+
+        INSERT -> COMMIT -> SELECT -> VERIFY -> UPDATE -> DELETE
+        전체 CRUD 사이클을 하나의 트랜잭션으로 실행합니다.
+
+        Args:
+            connection: 데이터베이스 커넥션
+
+        Returns:
+            성공 시 True, 실패 시 False
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2938,10 +3792,22 @@ class LoadTestWorker:
 # 모니터링 스레드 - Enhanced
 # ============================================================================
 class MonitorThread(threading.Thread):
-    """모니터링 스레드"""
+    """모니터링 스레드
+
+    주기적으로 테스트 진행 상황을 로그로 출력합니다.
+    TPS, 레이턴시, 커넥션 풀 상태 등을 모니터링합니다.
+    """
 
     def __init__(self, interval_seconds: float, end_time: datetime,
                  sub_second_interval_ms: int, db_adapter: DatabaseAdapter):
+        """MonitorThread 초기화
+
+        Args:
+            interval_seconds: 모니터링 출력 간격 (초)
+            end_time: 테스트 종료 시간
+            sub_second_interval_ms: Sub-second TPS 측정 윈도우 (밀리초)
+            db_adapter: 데이터베이스 어댑터 (풀 상태 조회용)
+        """
         super().__init__(name="Monitor", daemon=True)
         self.interval_seconds = interval_seconds
         self.end_time = end_time
@@ -2951,6 +3817,11 @@ class MonitorThread(threading.Thread):
         self.warmup_end_logged = False
 
     def run(self):
+        """모니터링 메인 루프
+
+        interval_seconds 간격으로 성능 통계를 로그로 출력합니다.
+        Graceful shutdown 요청 시 또는 테스트 종료 시 중단됩니다.
+        """
         logger.info(f"[Monitor] Starting (interval: {self.interval_seconds}s)")
 
         while self.running and datetime.now() < self.end_time:
@@ -3003,6 +3874,7 @@ class MonitorThread(threading.Thread):
         logger.info("[Monitor] Stopped")
 
     def stop(self):
+        """모니터링 스레드 중지 요청"""
         self.running = False
 
 
@@ -3010,13 +3882,27 @@ class MonitorThread(threading.Thread):
 # 부하 테스터 메인 클래스
 # ============================================================================
 class MultiDBLoadTester:
-    """멀티 데이터베이스 부하 테스터"""
+    """멀티 데이터베이스 부하 테스터
+
+    Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2 등
+    다양한 데이터베이스에 대한 부하 테스트를 수행합니다.
+    """
 
     def __init__(self, config: DatabaseConfig):
+        """MultiDBLoadTester 초기화
+
+        Args:
+            config: 데이터베이스 연결 및 테스트 설정
+        """
         self.config = config
         self.db_adapter = self._create_adapter()
 
     def _create_adapter(self) -> DatabaseAdapter:
+        """설정에 맞는 데이터베이스 어댑터 생성
+
+        Returns:
+            해당 DB 타입의 어댑터 인스턴스
+        """
         db_type = self.config.db_type.lower()
 
         adapters = {
@@ -3034,6 +3920,10 @@ class MultiDBLoadTester:
         return adapters[db_type](self.config.jre_dir)
 
     def print_ddl(self):
+        """테이블 생성 DDL 출력
+
+        해당 데이터베이스 타입에 맞는 DDL을 콘솔에 출력합니다.
+        """
         print("\n" + "=" * 80)
         print(f"DDL for {self.config.db_type.upper()} (JDBC)")
         print("=" * 80)
@@ -3180,7 +4070,19 @@ class MultiDBLoadTester:
     def _print_final_stats(self, thread_count: int, duration_seconds: int,
                            total_transactions: int, mode: str,
                            warmup_seconds: int, target_tps: int, batch_size: int):
-        """최종 통계 출력"""
+        """최종 통계 출력
+
+        테스트 완료 후 최종 성능 통계를 로그로 출력합니다.
+
+        Args:
+            thread_count: 워커 스레드 수
+            duration_seconds: 테스트 실행 시간 (초)
+            total_transactions: 총 트랜잭션 수
+            mode: 작업 모드
+            warmup_seconds: 워밍업 시간 (초)
+            target_tps: 목표 TPS
+            batch_size: 배치 크기
+        """
         final_stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
 
@@ -3221,7 +4123,17 @@ class MultiDBLoadTester:
 
     def _export_results(self, output_format: str, output_file: str,
                         thread_count: int, duration_seconds: int, mode: str):
-        """결과 내보내기"""
+        """결과 파일 내보내기
+
+        테스트 결과를 지정된 형식(CSV/JSON)으로 파일에 저장합니다.
+
+        Args:
+            output_format: 출력 형식 (csv 또는 json)
+            output_file: 출력 파일 경로
+            thread_count: 워커 스레드 수
+            duration_seconds: 테스트 실행 시간 (초)
+            mode: 작업 모드
+        """
         stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
         time_series = perf_counter.time_series
@@ -3244,6 +4156,13 @@ class MultiDBLoadTester:
 # 명령행 인자 파싱
 # ============================================================================
 def parse_arguments():
+    """명령행 인자 파싱
+
+    CLI에서 입력된 인자들을 파싱하여 argparse.Namespace 객체로 반환합니다.
+
+    Returns:
+        파싱된 명령행 인자를 담은 Namespace 객체
+    """
     parser = argparse.ArgumentParser(
         description='Multi-Database Load Tester v2.2 (JDBC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3347,6 +4266,11 @@ Examples:
 # 메인 함수
 # ============================================================================
 def main():
+    """프로그램 진입점
+
+    명령행 인자를 파싱하고 부하 테스트를 실행합니다.
+    JVM 초기화, 데이터베이스 연결, 워커 스레드 관리 등을 수행합니다.
+    """
     if '--version' in sys.argv:
         print(f"Multi-Database Load Tester v{VERSION} (JDBC)")
         return

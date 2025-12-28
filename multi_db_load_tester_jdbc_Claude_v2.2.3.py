@@ -83,7 +83,21 @@ console_formatter = logging.Formatter(console_format, datefmt='%H:%M:%S')
 
 
 class BelowWarningFilter(logging.Filter):
+    """WARNING 레벨 미만의 로그만 통과시키는 필터
+
+    INFO, DEBUG 레벨 로그를 콘솔에 출력하고,
+    WARNING 이상은 별도 에러 로그 파일로 분리하기 위해 사용
+    """
+
     def filter(self, record: logging.LogRecord) -> bool:
+        """로그 레코드 필터링
+
+        Args:
+            record: 로그 레코드
+
+        Returns:
+            WARNING 미만이면 True, 아니면 False
+        """
         return record.levelno < logging.WARNING
 
 file_handler = logging.FileHandler('multi_db_load_test_jdbc.log')
@@ -122,9 +136,14 @@ class WorkMode:
 # Graceful Shutdown Handler
 # ============================================================================
 class GracefulShutdown:
-    """Graceful Shutdown 핸들러"""
+    """Graceful Shutdown 핸들러
+
+    SIGINT(Ctrl+C) 및 SIGTERM 시그널을 처리하여
+    진행 중인 트랜잭션을 완료한 후 안전하게 종료합니다.
+    """
 
     def __init__(self):
+        """초기화 및 시그널 핸들러 등록"""
         self.shutdown_requested = False
         self.lock = threading.Lock()
 
@@ -133,16 +152,28 @@ class GracefulShutdown:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
+        """시그널 수신 시 호출되는 핸들러
+
+        Args:
+            signum: 시그널 번호
+            frame: 현재 스택 프레임
+        """
         with self.lock:
             if not self.shutdown_requested:
                 self.shutdown_requested = True
                 logger.info("\n[Shutdown] Graceful shutdown requested. Finishing current transactions...")
 
     def is_shutdown_requested(self) -> bool:
+        """종료 요청 여부 확인
+
+        Returns:
+            종료가 요청되었으면 True
+        """
         with self.lock:
             return self.shutdown_requested
 
     def request_shutdown(self):
+        """프로그래밍 방식으로 종료 요청"""
         with self.lock:
             self.shutdown_requested = True
 
@@ -155,9 +186,18 @@ shutdown_handler: Optional[GracefulShutdown] = None
 # 성능 카운터 (Thread-Safe) - Enhanced with Sub-second Metrics
 # ============================================================================
 class PerformanceCounter:
-    """스레드 안전 성능 카운터 - 1초 이내 측정 지원"""
+    """스레드 안전 성능 카운터 - 1초 이내 측정 지원
+
+    멀티스레드 환경에서 TPS, 레이턴시, 에러 카운트 등을
+    실시간으로 측정하고 통계를 제공합니다.
+    """
 
     def __init__(self, sub_second_window_ms: int = 100):
+        """성능 카운터 초기화
+
+        Args:
+            sub_second_window_ms: 서브초 TPS 측정 윈도우 (밀리초)
+        """
         self.lock = threading.Lock()
         self.total_inserts = 0
         self.total_selects = 0
@@ -235,30 +275,41 @@ class PerformanceCounter:
                 self.latencies.append(latency_ms)
 
     def increment_insert(self, count: int = 1):
+        """INSERT 카운트 증가
+
+        Args:
+            count: 증가량 (배치 INSERT 시 사용)
+        """
         with self.lock:
             self.total_inserts += count
 
     def increment_select(self):
+        """SELECT 카운트 증가"""
         with self.lock:
             self.total_selects += 1
 
     def increment_update(self):
+        """UPDATE 카운트 증가"""
         with self.lock:
             self.total_updates += 1
 
     def increment_delete(self):
+        """DELETE 카운트 증가"""
         with self.lock:
             self.total_deletes += 1
 
     def increment_error(self):
+        """에러 카운트 증가"""
         with self.lock:
             self.total_errors += 1
 
     def increment_verification_failure(self):
+        """검증 실패 카운트 증가"""
         with self.lock:
             self.verification_failures += 1
 
     def increment_connection_recreate(self):
+        """커넥션 재생성 카운트 증가"""
         with self.lock:
             self.connection_recreates += 1
 
@@ -407,9 +458,18 @@ perf_counter: Optional[PerformanceCounter] = None
 # Rate Limiter (Token Bucket Algorithm)
 # ============================================================================
 class RateLimiter:
-    """Token Bucket 기반 Rate Limiter"""
+    """Token Bucket 기반 Rate Limiter
+
+    목표 TPS를 초과하지 않도록 요청 속도를 제한합니다.
+    버스트 트래픽을 허용하면서도 평균 처리량을 제한합니다.
+    """
 
     def __init__(self, target_tps: int):
+        """Rate Limiter 초기화
+
+        Args:
+            target_tps: 목표 TPS (0 이하면 비활성화)
+        """
         self.target_tps = target_tps
         self.tokens = target_tps
         self.max_tokens = target_tps * 2  # 버스트 허용
@@ -422,7 +482,14 @@ class RateLimiter:
             self.enabled = True
 
     def acquire(self, timeout: float = 1.0) -> bool:
-        """토큰 획득 (Rate Limiting)"""
+        """토큰 획득 (Rate Limiting)
+
+        Args:
+            timeout: 최대 대기 시간 (초)
+
+        Returns:
+            토큰 획득 성공 여부
+        """
         if not self.enabled:
             return True
 
@@ -884,7 +951,7 @@ class JDBCConnectionPool:
                 logger.error(f"[Health Check] Error: {e}")
 
     def _check_idle_connections(self):
-        """Idle connection health check and cleanup."""
+        """유휴 커넥션 Health Check 및 정리"""
         checked = 0
         removed = 0
         recycled = 0
@@ -2257,10 +2324,10 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 
 
 # ============================================================================
-# DB2 JDBC Adapter
+# DB2 JDBC 어댑터
 # ============================================================================
 class DB2JDBCAdapter(DatabaseAdapter):
-    """IBM DB2 JDBC adapter"""
+    """IBM DB2 JDBC 어댑터"""
 
     def __init__(self, jre_dir: str = './jre'):
         self.pool = None
@@ -2504,7 +2571,12 @@ class DatabaseConfig:
 # 부하 테스트 워커 - Enhanced
 # ============================================================================
 class LoadTestWorker:
-    """부하 테스트 워커 - 전체 기능 지원"""
+    """부하 테스트 워커 - 전체 기능 지원
+
+    각 워커 스레드에서 실행되어 DB 작업을 수행합니다.
+    INSERT, SELECT, UPDATE, DELETE 등 다양한 모드를 지원하며,
+    커넥션 오류 시 자동 재연결 로직을 포함합니다.
+    """
     ERROR_LOG_INTERVAL_MS = 10000
     MAX_CONNECTION_RETRIES = 3
     # [DB 재기동 복구 최적화] 최대 backoff 시간을 1초로 제한
@@ -2533,15 +2605,35 @@ class LoadTestWorker:
         self.current_backoff_ms = 100
 
     def generate_random_data(self, length: int = 500) -> str:
+        """랜덤 데이터 생성
+
+        Args:
+            length: 생성할 문자열 길이
+
+        Returns:
+            랜덤 문자열
+        """
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
     def is_during_ramp_up(self) -> bool:
-        """Ramp-up ???? ??"""
+        """Ramp-up 기간 여부 확인
+
+        Returns:
+            Ramp-up 기간이면 True
+        """
         if self.ramp_up_end_time is None:
             return False
         return datetime.now() < self.ramp_up_end_time
 
     def _is_connection_valid(self, connection) -> bool:
+        """커넥션 유효성 검사
+
+        Args:
+            connection: 검사할 커넥션
+
+        Returns:
+            유효하면 True
+        """
         try:
             if connection is None:
                 return False
@@ -2553,6 +2645,11 @@ class LoadTestWorker:
             return False
 
     def _get_valid_connection(self):
+        """유효한 커넥션 획득 (재시도 로직 포함)
+
+        Returns:
+            유효한 커넥션 객체
+        """
         for retry in range(self.MAX_CONNECTION_RETRIES):
             try:
                 conn = self.db_adapter.get_connection()
@@ -2572,9 +2669,16 @@ class LoadTestWorker:
         return self.db_adapter.get_connection()
 
     def reset_backoff(self):
+        """백오프 시간 초기화"""
         self.current_backoff_ms = 100
 
     def log_error(self, operation: str, message: str):
+        """에러 로깅 (중복 억제 기능 포함)
+
+        Args:
+            operation: 작업 유형 (Insert, Select 등)
+            message: 에러 메시지
+        """
         if message and (
             'Connection is closed' in message or
             'connection is closed' in message or
@@ -2601,6 +2705,14 @@ class LoadTestWorker:
             logger.debug(f"[{self.thread_name}] {operation} error: {message}")
 
     def execute_insert(self, connection) -> bool:
+        """INSERT 작업 실행
+
+        Args:
+            connection: DB 커넥션
+
+        Returns:
+            성공 여부
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2634,6 +2746,15 @@ class LoadTestWorker:
                     pass
 
     def execute_select(self, connection, max_id: int) -> bool:
+        """SELECT 작업 실행
+
+        Args:
+            connection: DB 커넥션
+            max_id: 조회 가능한 최대 ID
+
+        Returns:
+            성공 여부
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2657,6 +2778,15 @@ class LoadTestWorker:
                     pass
 
     def execute_update(self, connection, max_id: int) -> bool:
+        """UPDATE 작업 실행
+
+        Args:
+            connection: DB 커넥션
+            max_id: 업데이트 가능한 최대 ID
+
+        Returns:
+            성공 여부
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2685,6 +2815,15 @@ class LoadTestWorker:
                     pass
 
     def execute_delete(self, connection, max_id: int) -> bool:
+        """DELETE 작업 실행
+
+        Args:
+            connection: DB 커넥션
+            max_id: 삭제 가능한 최대 ID
+
+        Returns:
+            성공 여부
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2713,7 +2852,15 @@ class LoadTestWorker:
                     pass
 
     def execute_mixed(self, connection, max_id: int) -> bool:
-        """혼합 모드: INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%"""
+        """혼합 모드 작업 실행: INSERT 60%, SELECT 20%, UPDATE 15%, DELETE 5%
+
+        Args:
+            connection: DB 커넥션
+            max_id: 작업 가능한 최대 ID
+
+        Returns:
+            성공 여부
+        """
         rand = random.random()
         if rand < 0.60:
             return self.execute_insert(connection)
@@ -2725,7 +2872,14 @@ class LoadTestWorker:
             return self.execute_delete(connection, max_id)
 
     def execute_full(self, connection) -> bool:
-        """전체 트랜잭션: INSERT -> COMMIT -> SELECT -> VERIFY"""
+        """전체 트랜잭션 실행: INSERT -> COMMIT -> SELECT -> UPDATE -> DELETE
+
+        Args:
+            connection: DB 커넥션
+
+        Returns:
+            성공 여부
+        """
         cursor = None
         start_time = time.time()
         try:
@@ -2852,10 +3006,22 @@ class LoadTestWorker:
 # 모니터링 스레드 - Enhanced
 # ============================================================================
 class MonitorThread(threading.Thread):
-    """모니터링 스레드"""
+    """모니터링 스레드
+
+    주기적으로 성능 통계를 수집하고 로그에 출력합니다.
+    TPS, 레이턴시, 커넥션 풀 상태 등을 실시간 모니터링합니다.
+    """
 
     def __init__(self, interval_seconds: float, end_time: datetime,
                  sub_second_interval_ms: int, db_adapter: DatabaseAdapter):
+        """모니터 스레드 초기화
+
+        Args:
+            interval_seconds: 모니터링 주기 (초)
+            end_time: 테스트 종료 시간
+            sub_second_interval_ms: 서브초 측정 간격 (밀리초)
+            db_adapter: 데이터베이스 어댑터
+        """
         super().__init__(name="Monitor", daemon=True)
         self.interval_seconds = interval_seconds
         self.end_time = end_time
@@ -2865,6 +3031,11 @@ class MonitorThread(threading.Thread):
         self.warmup_end_logged = False
 
     def _log_sample(self, tag: str = "Monitor"):
+        """성능 통계 샘플 로깅
+
+        Args:
+            tag: 로그 태그
+        """
         interval_stats = perf_counter.get_interval_stats()
         stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
@@ -2907,9 +3078,15 @@ class MonitorThread(threading.Thread):
         perf_counter.record_time_series(pool_stats)
 
     def sample_once(self, tag: str = "Monitor"):
+        """단일 샘플 수집 및 로깅
+
+        Args:
+            tag: 로그 태그
+        """
         self._log_sample(tag=tag)
 
     def run(self):
+        """모니터링 스레드 메인 루프"""
         logger.info(f"[Monitor] Starting (interval: {self.interval_seconds}s)")
 
         while self.running and datetime.now() < self.end_time:
@@ -2922,6 +3099,7 @@ class MonitorThread(threading.Thread):
         logger.info("[Monitor] Stopped")
 
     def stop(self):
+        """모니터링 스레드 중지"""
         self.running = False
 
 
@@ -2929,13 +3107,27 @@ class MonitorThread(threading.Thread):
 # 부하 테스터 메인 클래스
 # ============================================================================
 class MultiDBLoadTester:
-    """멀티 데이터베이스 부하 테스터"""
+    """멀티 데이터베이스 부하 테스터
+
+    다양한 데이터베이스 (Oracle, PostgreSQL, MySQL, SQL Server, Tibero, DB2)에
+    대해 부하 테스트를 수행합니다.
+    """
 
     def __init__(self, config: DatabaseConfig):
+        """부하 테스터 초기화
+
+        Args:
+            config: 데이터베이스 연결 설정
+        """
         self.config = config
         self.db_adapter = self._create_adapter()
 
     def _create_adapter(self) -> DatabaseAdapter:
+        """데이터베이스 타입에 맞는 어댑터 생성
+
+        Returns:
+            DatabaseAdapter 인스턴스
+        """
         db_type = self.config.db_type.lower()
 
         adapters = {
@@ -2953,6 +3145,7 @@ class MultiDBLoadTester:
         return adapters[db_type](self.config.jre_dir)
 
     def print_ddl(self):
+        """DDL 스크립트 출력"""
         print("\n" + "=" * 80)
         print(f"DDL for {self.config.db_type.upper()} (JDBC)")
         print("=" * 80)
@@ -3176,6 +3369,11 @@ class MultiDBLoadTester:
 # 명령행 인자 파싱
 # ============================================================================
 def parse_arguments():
+    """명령행 인자 파싱
+
+    Returns:
+        파싱된 인자 객체
+    """
     parser = argparse.ArgumentParser(
         description='Multi-Database Load Tester v2.3.0 (JDBC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3283,6 +3481,11 @@ Examples:
 # 메인 함수
 # ============================================================================
 def main():
+    """프로그램 진입점
+
+    명령행 인자를 파싱하고 부하 테스트를 실행합니다.
+    JVM 초기화, 데이터베이스 연결, 워커 스레드 관리 등을 수행합니다.
+    """
     if '--version' in sys.argv:
         print(f"Multi-Database Load Tester v{VERSION} (JDBC)")
         return
