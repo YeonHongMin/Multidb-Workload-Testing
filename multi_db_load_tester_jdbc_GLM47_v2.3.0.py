@@ -266,7 +266,7 @@ class PerformanceCounter:
             self.connection_recreates += 1
 
     def get_sub_second_tps(self) -> float:
-        """최근 1초간의 TPS"""
+        """최근 1초간의 TPS (실시간 처리량)"""
         current_time = time.time()
 
         with self.recent_lock:
@@ -278,7 +278,7 @@ class PerformanceCounter:
         return float(count)
 
     def get_windowed_tps(self, window_ms: int = None) -> float:
-        """지정된 윈도우 내 TPS"""
+        """지정된 윈도우 내 TPS (지정된 시간 범위의 평균 처리량)"""
         if window_ms is None:
             window_ms = self.sub_second_window_ms
 
