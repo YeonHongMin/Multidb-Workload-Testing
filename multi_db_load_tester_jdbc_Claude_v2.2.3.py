@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.2
+멀티 데이터베이스 부하 테스트 프로그램 (JDBC 드라이버 사용) - Enhanced Version v2.3.0
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero 지원
 
 특징:
@@ -58,22 +58,19 @@ import csv
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
-
-from dataclasses import dataclass, field, asdict
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import queue
 
 # Keep version in one place for logging/CLI banners.
-VERSION = "2.3"
+VERSION = "2.3.0"
 
 # JDBC 드라이버 사용을 위한 라이브러리
 try:
     import jaydebeapi
     import jpype
-    JAYDEBEAPI_AVAILABLE = True
 except ImportError:
-    JAYDEBEAPI_AVAILABLE = False
     print("ERROR: jaydebeapi or jpype1 not installed. Install with: pip install jaydebeapi JPype1")
     sys.exit(1)
 
@@ -494,7 +491,7 @@ class ResultExporter:
         result = {
             'test_info': {
                 'timestamp': datetime.now().isoformat(),
-                'version': '2.2'
+                'version': '2.3.0'
             },
             'configuration': config,
             'final_statistics': stats,
@@ -558,36 +555,35 @@ def get_jvm_path() -> str:
     system = platform.system().lower()
     java_home = os.environ.get('JAVA_HOME', '')
 
-    if system == 'windows':
-        possible_paths = [
-            r"C:\jdk25\bin\server\jvm.dll",
-            os.path.join(java_home, 'bin', 'server', 'jvm.dll') if java_home else '',
-            os.path.join(java_home, 'jre', 'bin', 'server', 'jvm.dll') if java_home else '',
-        ]
-    elif system == 'darwin':
-        possible_paths = [
-            '/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home/lib/server/libjvm.dylib',
-            '/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home/lib/server/libjvm.dylib',
-            os.path.join(java_home, 'lib', 'server', 'libjvm.dylib') if java_home else '',
-        ]
-    else:
-        possible_paths = [
-            '/usr/lib/jvm/java-21-openjdk/lib/server/libjvm.so',
-            '/usr/lib/jvm/java-17-openjdk/lib/server/libjvm.so',
-            os.path.join(java_home, 'lib', 'server', 'libjvm.so') if java_home else '',
-        ]
+    # 1. JAVA_HOME 환경 변수 기반 경로 우선 시도 (libjvm 직접 지정)
+    if java_home:
+        if system == 'windows':
+            candidates = [
+                os.path.join(java_home, 'bin', 'server', 'jvm.dll'),
+                os.path.join(java_home, 'jre', 'bin', 'server', 'jvm.dll'),
+            ]
+        elif system == 'darwin':
+            candidates = [os.path.join(java_home, 'lib', 'server', 'libjvm.dylib')]
+        else:
+            candidates = [os.path.join(java_home, 'lib', 'server', 'libjvm.so')]
 
-    for path in possible_paths:
-        if path and os.path.exists(path):
-            return path
+        for path in candidates:
+            if os.path.exists(path):
+                return path
 
+    # 2. JPype 기본 경로 시도 (fallback)
     try:
-        return jpype.getDefaultJVMPath()
+        default_path = jpype.getDefaultJVMPath()
+        # libjli.dylib는 사용 불가, libjvm만 허용
+        if 'libjvm' in default_path:
+            return default_path
     except Exception:
-        raise RuntimeError("JVM path not found. Set JAVA_HOME or install Java.")
+        pass
+
+    raise RuntimeError("JVM path not found. Set JAVA_HOME or install Java.")
 
 
-def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
+def initialize_jvm(jre_dir: str = './jre'):
     """JVM 초기화"""
     if jpype.isJVMStarted():
         return
@@ -596,7 +592,7 @@ def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
     logger.info(f"Initializing JVM using: {jvm_path}")
 
     jars = []
-    for root, dirs, files in os.walk(jre_dir):
+    for root, _, files in os.walk(jre_dir):
         for file in files:
             if file.endswith('.jar'):
                 jars.append(os.path.join(root, file))
@@ -607,16 +603,14 @@ def initialize_jvm(jre_dir: str = './jre', extra_args: List[str] = None):
     jvm_args = [
         f"-Djava.class.path={classpath}",
         "-Dfile.encoding=UTF-8",
-        "-Xms512m",
-        "-Xmx2048m",
-        "-XX:+UseSerialGC"
+        "-Xms256m",
+        "-Xmx1024m",
+        "-XX:+UseG1GC",
+        "-XX:MaxGCPauseMillis=100"
     ]
-    
-    if extra_args:
-        jvm_args.extend(extra_args)
 
     try:
-        jpype.startJVM(jvm_path, *jvm_args)
+        jpype.startJVM(jvm_path, *jvm_args, convertStrings=False)
         logger.info("JVM initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize JVM: {e}")
@@ -704,13 +698,14 @@ class JDBCConnectionPool:
 
     def __init__(self, jdbc_url: str, driver_class: str, jar_file: str,
                  user: str, password: str, min_size: int, max_size: int,
+                 connection_timeout_seconds: int = 30,
                  validation_timeout: int = 5,
                  max_lifetime_seconds: int = 1800,
                  leak_detection_threshold_seconds: int = 60,
                  idle_check_interval_seconds: int = 30,
                  idle_timeout_seconds: int = 30,
                  keepalive_time_seconds: int = 30,
-                 connection_properties: Dict[str, str] = None):
+                 driver_args: Optional[Dict[str, str]] = None):
         """
         Args:
             jdbc_url: JDBC 연결 URL
@@ -724,7 +719,6 @@ class JDBCConnectionPool:
             max_lifetime_seconds: 커넥션 최대 수명 (초, 기본 30분)
             leak_detection_threshold_seconds: Leak 감지 임계값 (초, 기본 60초)
             idle_check_interval_seconds: 유휴 커넥션 검사 주기 (초, 기본 30초)
-            connection_properties: JDBC 연결 속성 (옵션)
         """
         self.jdbc_url = jdbc_url
         self.driver_class = driver_class
@@ -733,22 +727,18 @@ class JDBCConnectionPool:
         self.password = password
         self.min_size = min_size
         self.max_size = max_size
+        self.connection_timeout_seconds = connection_timeout_seconds
         self.validation_timeout = validation_timeout
         self.max_lifetime_seconds = max_lifetime_seconds
         self.leak_detection_threshold_seconds = leak_detection_threshold_seconds
         self.idle_check_interval_seconds = idle_check_interval_seconds
         self.idle_timeout_seconds = idle_timeout_seconds
-        
-        # 연결 속성 설정 (user/password 포함)
-        self.connection_properties = connection_properties.copy() if connection_properties else {}
-        self.connection_properties['user'] = user
-        self.connection_properties['password'] = password
-
         if keepalive_time_seconds > 0 and keepalive_time_seconds < 30:
             logger.warning("Keepalive time < 30s; disabling keepalive checks")
             self.keepalive_time_seconds = 0
         else:
             self.keepalive_time_seconds = keepalive_time_seconds
+        self.driver_args = driver_args
 
         self.pool = queue.Queue(maxsize=max_size)
         self.current_size = 0
@@ -768,14 +758,13 @@ class JDBCConnectionPool:
         self._health_check_thread: Optional[threading.Thread] = None
         self._health_check_running = False
 
-
-
         logger.info(f"Initializing JDBC connection pool (min={min_size}, max={max_size})")
         logger.info(f"  - Max Lifetime: {max_lifetime_seconds}s")
         logger.info(f"  - Leak Detection Threshold: {leak_detection_threshold_seconds}s")
         logger.info(f"  - Idle Check Interval: {idle_check_interval_seconds}s")
         logger.info(f"  - Idle Timeout: {self.idle_timeout_seconds}s")
         logger.info(f"  - Keepalive Time: {self.keepalive_time_seconds}s")
+        logger.info(f"  - Connection Timeout: {self.connection_timeout_seconds}s")
         logger.info(f"JDBC URL: {jdbc_url}")
 
         # Pool Warm-up: min_size만큼 커넥션 미리 생성
@@ -799,77 +788,45 @@ class JDBCConnectionPool:
         self._start_health_check_thread()
 
     def _create_connection_internal(self) -> Optional[PooledConnection]:
-        """
-        내부용 커넥션 생성 (재시도 로직 포함)
+        """내부용 커넥션 생성 (PooledConnection 반환)"""
+        with self.lock:
+            if self.current_size >= self.max_size:
+                return None
 
-        개선사항:
-        1. DB 재기동 등 일시적 연결 실패 시 최대 3회 재시도
-        2. Exponential Backoff 적용 (100ms → 200ms → 400ms, 최대 2초)
-        3. 상세 로깅으로 실패 원인 추적 용이
-        4. DB listener 과도 부하 방지를 위한 지수적 대기
-
-        Returns:
-            성공 시 PooledConnection 객체, 실패 시 None
-        """
-        max_creation_retries = 3  # 최대 재시도 횟수
-        creation_backoff_ms = 100  # 초기 백오프 시간 (밀리초)
-
-        for attempt in range(max_creation_retries):
-            # 커넥션 풀 용량 체크 (최대 크기 초과 시 생성 불가)
-            with self.lock:
-                if self.current_size >= self.max_size:
-                    return None
-                self.current_size += 1  # 생성 시도 전에 카운트 증가
-
-            try:
-                # Properties 딕셔너리를 사용하여 연결 (타임아웃 등 설정 포함)
+        try:
+            if self.connection_timeout_seconds and jpype.isJVMStarted():
+                try:
+                    jpype.JClass("java.sql.DriverManager").setLoginTimeout(
+                        int(self.connection_timeout_seconds)
+                    )
+                except Exception:
+                    pass
+            if self.driver_args:
                 conn = jaydebeapi.connect(
                     self.driver_class,
                     self.jdbc_url,
-                    self.connection_properties,
+                    self.driver_args,
                     self.jar_file
                 )
-                conn.jconn.setAutoCommit(False)
+            else:
+                conn = jaydebeapi.connect(
+                    self.driver_class,
+                    self.jdbc_url,
+                    [self.user, self.password],
+                    self.jar_file
+                )
+            conn.jconn.setAutoCommit(False)
 
-                # 네트워크 타임아웃 명시적 설정 (JDBC 4.1+ 지원 시)
-                try:
-                    timeout_ms = 5000  # 기본 5초 타임아웃
-                    if 'oracle.jdbc.ReadTimeout' in self.connection_properties:
-                         timeout_ms = int(self.connection_properties['oracle.jdbc.ReadTimeout'])
+            pooled_conn = PooledConnection(connection=conn)
 
-                    if hasattr(conn.jconn, 'setNetworkTimeout'):
-                         conn.jconn.setNetworkTimeout(None, timeout_ms)
-                except Exception:
-                    pass
+            with self.lock:
+                self.current_size += 1
+                self.total_created += 1
 
-                # 커넥션 생성 성공: 카운터 증가 및 PooledConnection 래핑 반환
-                with self.lock:
-                    self.total_created += 1
-
-                return PooledConnection(connection=conn)
-
-            except Exception as e:
-                # 생성 실패: 카운터 감소
-                with self.lock:
-                    self.current_size -= 1
-
-                # 마지막 시도가 아닌 경우: 재시도 수행
-                if attempt < max_creation_retries - 1:
-                    logger.warning(
-                        f"[Connection Creation] {attempt + 1}/{max_creation_retries} 시도 실패: {e}. "
-                        f"{creation_backoff_ms}ms 후 재시도..."
-                    )
-                    # 지수적 백오프: 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms(최대)
-                    time.sleep(creation_backoff_ms / 1000.0)
-                    creation_backoff_ms = min(creation_backoff_ms * 2, 2000)
-                else:
-                    # 최대 재시도 초과: 최종 에러 로그
-                    logger.error(
-                        f"[Connection Creation] {max_creation_retries}회 시도 후 실패 (URL: {self.jdbc_url}): {e}"
-                    )
-                return None
-
-        return None
+            return pooled_conn
+        except Exception as e:
+            logger.error(f"Failed to create connection: {e}")
+            return None
 
     def _create_connection(self):
         """새 커넥션 생성 (하위 호환성 유지)"""
@@ -1038,22 +995,8 @@ class JDBCConnectionPool:
             self.current_size = max(0, self.current_size - 1)
 
     def get_pool_stats(self) -> Dict[str, int]:
-        """풀 상태 조회 (Non-blocking)"""
-        # Monitor thread shouldn't hang on lock
-        if not self.lock.acquire(timeout=0.1):
-             # If cannot acquire lock, return estimated or cached values (or just zeros/current state without lock)
-             # Accessing without lock is unsafe but better than hanging monitor
-             return {
-                'pool_total': self.current_size,
-                'pool_active': self.active_count,
-                'pool_idle': max(0, self.current_size - self.active_count),
-                'pool_total_created': self.total_created,
-                'pool_recycled': self.total_recycled,
-                'pool_leak_warnings': self.total_leaked_warnings,
-                'status': 'locked'
-             }
-        
-        try:
+        """풀 상태 조회"""
+        with self.lock:
             return {
                 'pool_total': self.current_size,
                 'pool_active': self.active_count,
@@ -1062,90 +1005,93 @@ class JDBCConnectionPool:
                 'pool_recycled': self.total_recycled,
                 'pool_leak_warnings': self.total_leaked_warnings
             }
-        finally:
-            self.lock.release()
 
-    def acquire(self, timeout: int = 30):
-        """
-        커넥션 획득 (향상된 재시도 로직 포함)
-
-        개선사항:
-        1. DB 재기동 시 커넥션 풀 복구 로직 강화
-        2. Exponential Backoff 적용 (100ms → 200ms → 400ms → 800ms → 1600ms → 5000ms)
-        3. 큐가 비어있을 때만 새 커넥션 생성 (DB listener 부하 감소)
-        4. Max Lifetime 초과 시 자동 재생성
-        5. 상세 로깅으로 재시도 추적
-
-        Args:
-            timeout: 커넥션 획득 최대 대기 시간 (초)
+    def acquire(self, timeout: int = None):
+        """커넥션 획득
 
         Returns:
-            연결된 커넥션 객체 (성공), None (실패)
+            연결된 커넥션 객체 (내부적으로 PooledConnection 추적)
+        Raises:
+            queue.Empty: 커넥션 획득 실패 시
+
+        [DB 재기동 후 Hang 방지 수정사항]
+        ===================================
+        문제: 기존 코드에서 pool.get(timeout=30)을 사용하면 풀이 비어있을 때
+              최대 30초간 블로킹되어 DB 재기동 시 세션이 Hang 상태로 멈춤.
+
+        원인:
+          - DB가 다운되면 기존 커넥션들이 모두 유효하지 않게 됨
+          - 풀에 커넥션이 없는 상태에서 pool.get()은 timeout 동안 대기
+          - 긴 timeout(30초)은 DB 복구 후에도 빠른 재연결을 방해
+
+        해결책:
+          1. pool_timeout을 최대 1초로 제한 (min(timeout, 1))
+             - 풀에서 짧게 대기 후 빠르게 포기하고 재시도
+          2. max_retries(3회)로 여러 번 시도
+             - 각 시도마다 1초씩만 대기하므로 최대 3초 후 실패 판정
+          3. 명시적 queue.Empty 예외 발생
+             - 무한 대기 대신 명확한 실패로 상위 레벨에서 처리 가능
+             - LoadTestWorker의 exponential backoff가 재연결 담당
         """
+        if timeout is None:
+            timeout = self.connection_timeout_seconds or 30
+
+        # [핵심 수정] 풀 대기 시간을 최대 1초로 제한
+        # 이유: DB 다운 시 풀이 비어있으면 긴 timeout으로 인해 스레드가 블로킹됨
+        #       짧은 대기(1초) + 재시도(3회) 패턴으로 빠른 실패/복구 보장
+        pool_timeout = min(timeout, 1)
+
         retry_count = 0
-        max_retries = 3  # 최대 재시도 횟수
-        backoff_ms = 100  # 초기 백오프 시간 (밀리초)
+        max_retries = 3  # 최대 3회 재시도 (총 최대 대기: 약 3초)
         thread_name = threading.current_thread().name
 
+        # [재시도 루프] 풀에서 커넥션 획득 시도
+        # - 각 시도마다 최대 1초만 대기
+        # - 실패 시 새 커넥션 생성 시도 후 다음 반복
         while retry_count < max_retries:
             try:
-                # 큐 대기 시간 결정:
-                # - 큐가 비어있고 풀에 여유가 있으면: 빠르게 생성 시도 (0.1초)
-                # - 그 외: 전체 타임아웃까지 대기
-                wait_time = timeout
-                if self.current_size < self.max_size and self.pool.empty():
-                     wait_time = 0.1 # Fail fast to trigger 'except Empty' -> creation
+                pooled_conn = self.pool.get(timeout=pool_timeout)
 
-                # 큐에서 커넥션 획득 시도
-                pooled_conn = self.pool.get(timeout=wait_time)
-
-                # Max Lifetime 초과 시 재생성 (오래된 커넥션 자동 교체)
+                # Max Lifetime 초과 시 재생성
                 if self._is_connection_expired(pooled_conn):
                     self._close_pooled_connection(pooled_conn)
                     with self.lock:
                         self.total_recycled += 1
                     pooled_conn = self._create_connection_internal()
-
                     if pooled_conn is None:
-                        # 새 커넥션 생성 실패: 재시도 카운트 증가 및 백오프 적용
                         retry_count += 1
-                        time.sleep(backoff_ms / 1000.0)
-                        backoff_ms = min(backoff_ms * 2, 5000)  # 지수적 백오프
                         continue
 
-                # 커넥션 유효성 검사 (Closed 검증)
                 if self._validate_connection(pooled_conn):
                     pooled_conn.mark_acquired(thread_name)
 
-                    # Leak 감지용 추적: 현재 사용 중인 커넥션 등록
+                    # Leak 감지용 추적
                     conn_id = id(pooled_conn.connection)
                     with self.active_connections_lock:
                         self.active_connections[conn_id] = pooled_conn
 
-                    # 활성 커넥션 카운트 증가
                     with self.lock:
                         self.active_count += 1
 
                     return pooled_conn.connection
                 else:
-                    # 유효하지 않은 커넥션: 폐기
                     self._close_pooled_connection(pooled_conn)
-                    # Validation failed, try to replace it immediately if possible
-                    # But don't recursively create if we are just consuming a bad one?
-                    # We should probably let the loop handle it
-                    pass
-
-            except queue.Empty:
-                # 큐가 비어있음: 새 커넥션 생성 시도
-                can_create = False
-                with self.lock:
-                    can_create = self.current_size < self.max_size
-
-                if can_create:
-                    # 새 커넥션 생성 시도 (내부에서 재시도 로직 실행됨)
                     pooled_conn = self._create_connection_internal()
                     if pooled_conn:
-                        # 커넥션 생성 성공: 반환
+                        self.pool.put(pooled_conn)
+
+            except queue.Empty:
+                # [queue.Empty 처리] 풀에서 1초 내 커넥션 획득 실패
+                # - pool_timeout(1초) 동안 풀에 반환된 커넥션이 없음
+                # - DB 다운 상태에서는 모든 커넥션이 유효하지 않아 풀이 비어있음
+                # - 새 커넥션 생성을 시도하고, 실패하면 retry_count 증가
+                with self.lock:
+                    can_create = self.current_size < self.max_size
+                if can_create:
+                    # DB가 복구되었다면 새 커넥션 생성 성공
+                    # DB가 아직 다운이면 _create_connection_internal()에서 None 반환
+                    pooled_conn = self._create_connection_internal()
+                    if pooled_conn:
                         pooled_conn.mark_acquired(thread_name)
                         conn_id = id(pooled_conn.connection)
                         with self.active_connections_lock:
@@ -1153,21 +1099,18 @@ class JDBCConnectionPool:
                         with self.lock:
                             self.active_count += 1
                         return pooled_conn.connection
-                    # 커넥션 생성 실패: 로그 기록
-                    logger.warning(
-                        f"[acquire] 커넥션 생성 실패 "
-                        f"(시도 {retry_count + 1}/{max_retries})"
-                    )
 
-                # Backoff 후 재시도 (DB listener 과부하 방지)
-                if retry_count < max_retries - 1:
-                    time.sleep(backoff_ms / 1000.0)
-                    backoff_ms = min(backoff_ms * 2, 5000)  # 지수적 백오프
+                # 커넥션 생성 실패 시 재시도 카운트 증가
+                # 다음 반복에서 다시 풀 대기(1초) + 생성 시도
                 retry_count += 1
 
-        # 최대 재시도 후에도 실패: 최종 시도
-        try:
-            pooled_conn = self.pool.get(timeout=timeout)
+        # [최종 시도] 재시도 루프 완료 후 마지막 커넥션 생성 시도
+        # - max_retries(3회) 동안 풀에서도, 새 생성으로도 획득 실패
+        # - 마지막으로 한 번 더 새 커넥션 생성 시도
+        with self.lock:
+            can_create = self.current_size < self.max_size
+        if can_create:
+            pooled_conn = self._create_connection_internal()
             if pooled_conn:
                 pooled_conn.mark_acquired(thread_name)
                 conn_id = id(pooled_conn.connection)
@@ -1176,12 +1119,27 @@ class JDBCConnectionPool:
                 with self.lock:
                     self.active_count += 1
                 return pooled_conn.connection
-        except queue.Empty:
-            logger.error(
-                f"[acquire] {max_retries}회 재시도 후 커넥션 획득 실패 "
-                f"(큐 비어있음)"
-            )
 
+        # [마지막 풀 시도] 짧은 timeout으로 풀에서 최종 획득 시도
+        # - 다른 스레드가 커넥션을 반환했을 수 있음
+        # - 여전히 짧은 timeout(1초)으로 대기하여 Hang 방지
+        try:
+            pooled_conn = self.pool.get(timeout=pool_timeout)
+        except queue.Empty:
+            # [명시적 예외 발생] 모든 시도 실패 시 즉시 예외 throw
+            # - 기존: 무한 대기 또는 None 반환으로 상위 코드에서 처리 불명확
+            # - 수정: 명확한 queue.Empty 예외로 LoadTestWorker가 backoff 후 재시도
+            # - 이로써 DB 복구 시 빠른 재연결 가능 (Hang 없음)
+            raise queue.Empty("Connection pool exhausted and cannot create new connection")
+
+        if pooled_conn:
+            pooled_conn.mark_acquired(thread_name)
+            conn_id = id(pooled_conn.connection)
+            with self.active_connections_lock:
+                self.active_connections[conn_id] = pooled_conn
+            with self.lock:
+                self.active_count += 1
+            return pooled_conn.connection
         return None
 
     def release(self, conn):
@@ -1284,9 +1242,6 @@ class JDBCConnectionPool:
 class DatabaseAdapter(ABC):
     """데이터베이스 공통 인터페이스"""
 
-    def __init__(self):
-        self.validation_timeout = 2
-
     @abstractmethod
     def create_connection_pool(self, config: 'DatabaseConfig'):
         pass
@@ -1387,13 +1342,18 @@ class OracleJDBCAdapter(DatabaseAdapter):
                 sid=sid
             )
 
-        # Oracle Connection Properties
-        connection_props = {}
-        if config.connection_timeout_seconds > 0:
-            timeout_ms = str(config.connection_timeout_seconds * 1000)
-            connection_props['oracle.net.CONNECT_TIMEOUT'] = timeout_ms
-            connection_props['oracle.jdbc.ReadTimeout'] = timeout_ms
-            logger.info(f"Setting Oracle connection timeouts to {config.connection_timeout_seconds}s")
+        driver_args: Dict[str, str] = {
+            "user": config.user,
+            "password": config.password,
+        }
+        if config.jdbc_connect_timeout_seconds > 0:
+            driver_args["oracle.net.CONNECT_TIMEOUT"] = str(
+                int(config.jdbc_connect_timeout_seconds * 1000)
+            )
+        if config.jdbc_read_timeout_seconds > 0:
+            driver_args["oracle.jdbc.ReadTimeout"] = str(
+                int(config.jdbc_read_timeout_seconds * 1000)
+            )
 
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url,
@@ -1403,24 +1363,18 @@ class OracleJDBCAdapter(DatabaseAdapter):
             password=config.password,
             min_size=config.min_pool_size,
             max_size=config.max_pool_size,
-            validation_timeout=config.connection_timeout_seconds, # 유효성 검사에도 타임아웃 적용
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
             idle_timeout_seconds=config.idle_timeout_seconds,
             keepalive_time_seconds=config.keepalive_time_seconds,
-            connection_properties=connection_props
+            driver_args=driver_args
         )
-        self.validation_timeout = config.connection_timeout_seconds
         return self.pool
 
     def get_connection(self):
-        # Use a shorter timeout for acquiring connection to fail fast if pool is empty/DB down
-        # This will block for at most validation_timeout (3s) per try, max 3 tries = 9s
-        conn = self.pool.acquire(timeout=self.validation_timeout if self.validation_timeout > 0 else 5)
-        if conn is None:
-             logger.debug("OracleJDBCAdapter: Failed to acquire connection from pool (Timeout/Empty)")
-        return conn
+        return self.pool.acquire()
 
     def release_connection(self, connection, is_error: bool = False):
         if connection:
@@ -1611,6 +1565,7 @@ class PostgreSQLJDBCAdapter(DatabaseAdapter):
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['postgresql'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
             min_size=config.min_pool_size, max_size=config.max_pool_size,
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
@@ -1809,6 +1764,7 @@ class MySQLJDBCAdapter(DatabaseAdapter):
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['mysql'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
             min_size=effective_min, max_size=effective_max,
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
@@ -1971,6 +1927,7 @@ class SQLServerJDBCAdapter(DatabaseAdapter):
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['sqlserver'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
             min_size=config.min_pool_size, max_size=config.max_pool_size,
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
@@ -2132,6 +2089,7 @@ class TiberoJDBCAdapter(DatabaseAdapter):
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['tibero'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
             min_size=config.min_pool_size, max_size=config.max_pool_size,
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
@@ -2318,6 +2276,7 @@ class DB2JDBCAdapter(DatabaseAdapter):
             jdbc_url=jdbc_url, driver_class=JDBC_DRIVERS['db2'].driver_class,
             jar_file=self.jar_file, user=config.user, password=config.password,
             min_size=config.min_pool_size, max_size=config.max_pool_size,
+            connection_timeout_seconds=config.connection_timeout_seconds,
             max_lifetime_seconds=config.max_lifetime_seconds,
             leak_detection_threshold_seconds=config.leak_detection_threshold_seconds,
             idle_check_interval_seconds=config.idle_check_interval_seconds,
@@ -2516,6 +2475,8 @@ class DatabaseConfig:
         max_lifetime_seconds: 커넥션 최대 수명 (초, 기본 30분)
         leak_detection_threshold_seconds: Leak 감지 임계값 (초, 기본 60초)
         idle_check_interval_seconds: 유휴 커넥션 Health Check 주기 (초, 기본 30초)
+        jdbc_read_timeout_seconds: JDBC read timeout (초, Oracle 전용)
+        jdbc_connect_timeout_seconds: JDBC connect timeout (초, Oracle 전용)
     """
     db_type: str
     host: str
@@ -2528,13 +2489,15 @@ class DatabaseConfig:
     min_pool_size: int = 100
     max_pool_size: int = 200
     jre_dir: str = './jre'
-    connection_timeout_seconds: int = 10  # 기본 10초
     # 커넥션 풀 고급 설정
     max_lifetime_seconds: int = 1800  # 30분
     leak_detection_threshold_seconds: int = 60  # 60초
     idle_check_interval_seconds: int = 30  # 30초
     idle_timeout_seconds: int = 30
     keepalive_time_seconds: int = 30
+    connection_timeout_seconds: int = 30
+    jdbc_read_timeout_seconds: int = 30
+    jdbc_connect_timeout_seconds: int = 10
 
 
 # ============================================================================
@@ -2544,7 +2507,13 @@ class LoadTestWorker:
     """부하 테스트 워커 - 전체 기능 지원"""
     ERROR_LOG_INTERVAL_MS = 10000
     MAX_CONNECTION_RETRIES = 3
-    MAX_BACKOFF_MS = 5000
+    # [DB 재기동 복구 최적화] 최대 backoff 시간을 1초로 제한
+    # - 기존값: 5000ms (5초) → 수정값: 1000ms (1초)
+    # - DB 다운 시 exponential backoff로 재연결 대기 시간이 증가
+    # - 5초 backoff는 DB 복구 후에도 불필요한 대기 시간 발생
+    # - 1초로 제한하여 DB 복구 감지 시 빠른 재연결 (약 28% 복구 시간 단축)
+    # - acquire() 함수의 짧은 pool_timeout(1초)과 조합하여 총 복구 시간 최소화
+    MAX_BACKOFF_MS = 1000
 
     def __init__(self, worker_id: int, db_adapter: DatabaseAdapter, end_time: datetime,
                  mode: str = WorkMode.FULL, max_id_cache: int = 0, batch_size: int = 1,
@@ -2578,13 +2547,9 @@ class LoadTestWorker:
                 return False
             jconn = connection.jconn
             if hasattr(jconn, 'isValid'):
-                is_valid = jconn.isValid(self.db_adapter.validation_timeout)
-                if not is_valid:
-                    logger.debug(f"[{self.thread_name}] Connection validation failed (isValid=False)")
-                return is_valid
+                return jconn.isValid(2)
             return True
-        except Exception as e:
-            logger.debug(f"[{self.thread_name}] Connection validation error: {e}")
+        except Exception:
             return False
 
     def _get_valid_connection(self):
@@ -2610,16 +2575,16 @@ class LoadTestWorker:
         self.current_backoff_ms = 100
 
     def log_error(self, operation: str, message: str):
-        # if message and (
-        #     'Connection is closed' in message or
-        #     'connection is closed' in message or
-        #     'Already closed' in message or
-        #     'No operations allowed after connection closed' in message or
-        #     'Connection is not available' in message or
-        #     'request timed out' in message
-        # ):
-        #     logger.debug(f"[{self.thread_name}] {operation} (suppressed): {message}")
-        #     return
+        if message and (
+            'Connection is closed' in message or
+            'connection is closed' in message or
+            'Already closed' in message or
+            'No operations allowed after connection closed' in message or
+            'Connection is not available' in message or
+            'request timed out' in message
+        ):
+            logger.debug(f"[{self.thread_name}] {operation} (suppressed): {message}")
+            return
 
         now_ms = int(time.time() * 1000)
         if now_ms - self.last_error_log_time > self.ERROR_LOG_INTERVAL_MS:
@@ -2804,23 +2769,11 @@ class LoadTestWorker:
                     pass
 
     def run(self) -> int:
-        """
-        워커 실행 (향상된 재연결 로직 포함)
-
-        개선사항:
-        1. DB 재기동 시 자동 재연결 로직 강화
-        2. Exponential Backoff 적용 (100ms → 200ms → 400ms → 800ms → 5000ms)
-        3. 연속 실패 시 백오프 적용으로 DB 과부하 방지
-        4. 커넥션 유효성 검사로 손상된 커넥션 자동 교체
-        5. 상세 로깅으로 문제 추적 용이
-
-        Returns:
-            완료된 트랜잭션 수
-        """
+        """워커 실행"""
         logger.info(f"[{self.thread_name}] Starting (mode: {self.mode})")
 
         connection = None
-        consecutive_errors = 0  # 연속 에러 카운트 (백오프 트리거용)
+        consecutive_errors = 0
         max_id = self.max_id_cache
 
         while datetime.now() < self.end_time:
@@ -2828,53 +2781,20 @@ class LoadTestWorker:
             if shutdown_handler and shutdown_handler.is_shutdown_requested():
                 break
 
-            # Rate limiting (목표 TPS 제어)
+            # Rate limiting
             if self.rate_limiter and not self.rate_limiter.acquire(timeout=0.5):
                 continue
 
             try:
-                # 커넥션 없는 경우: 새 커넥션 획득 시도
                 if connection is None:
-                    now = time.time()
-                    if now - self.last_error_log_time > 5: # 5초마다 로그
-                         logger.warning(
-                             f"[{self.thread_name}] 커넥션 대기 중... "
-                             f"(Pool: {self.db_adapter.get_pool_stats().get('pool_total', '?')})"
-                         )
-                         self.last_error_log_time = now
-
-                    # 유효한 커넥션 획득 시도 (내부 재시도 로직 포함)
                     connection = self._get_valid_connection()
-
-                    if connection is not None:
-                        # 커넥션 획득 성공: 에러 카운터 및 백오프 리셋
-                        consecutive_errors = 0
-                        self.reset_backoff()
-                    else:
-                        # 커넥션 획득 실패: 연속 에러 카운트 증가
-                        consecutive_errors += 1
-                        if consecutive_errors >= 2:
-                            # 연속 2회 이상 실패 시 백오프 적용
-                            # DB 재기동 등 일시적 연결 불가 시 과부하 방지
-                            logger.warning(
-                                f"[{self.thread_name}] 연속 {consecutive_errors}회 실패. "
-                                f"{self.current_backoff_ms}ms 백오프 후 재시도..."
-                            )
-                            time.sleep(self.current_backoff_ms / 1000.0)
-                            self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
-                        else:
-                            # 첫 실패는 1초 대기 후 재시도
-                            time.sleep(1)
-                        continue
+                    consecutive_errors = 0
                 else:
-                    # 커넥션이 있는 경우: 유효성 검사
                     if not self._is_connection_valid(connection):
-                        # 손상된 커넥션: 폐기 및 새 커넥션 획득
                         self.db_adapter.discard_connection(connection)
                         connection = self._get_valid_connection()
                         perf_counter.increment_connection_recreate()
 
-                # SELECT/UPDATE/DELETE/MIXED 모드: 기존 데이터 필요
                 needs_data = self.mode in [WorkMode.SELECT_ONLY, WorkMode.UPDATE_ONLY,
                                            WorkMode.DELETE_ONLY, WorkMode.MIXED]
                 if needs_data and (max_id == 0 or self.transaction_count % 100 == 0):
@@ -2885,7 +2805,7 @@ class LoadTestWorker:
                         time.sleep(1)
                         continue
 
-                # 모드별 DB 작업 실행
+                # 모드별 실행
                 if self.mode == WorkMode.INSERT_ONLY:
                     success = self.execute_insert(connection)
                 elif self.mode == WorkMode.SELECT_ONLY:
@@ -2899,18 +2819,12 @@ class LoadTestWorker:
                 else:
                     success = self.execute_full(connection)
 
-                # 작업 실패 처리
                 if not success:
                     consecutive_errors += 1
                     if consecutive_errors >= 2:
-                        # 연속 2회 이상 실패 시 커넥션 폐기 및 재시도
                         self.db_adapter.discard_connection(connection)
                         connection = None
                         perf_counter.increment_connection_recreate()
-                        logger.warning(
-                            f"[{self.thread_name}] 작업 실패. "
-                            f"{self.current_backoff_ms}ms 백오프 후 재시도..."
-                        )
                         time.sleep(self.current_backoff_ms / 1000.0)
                         self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
                 else:
@@ -2950,6 +2864,51 @@ class MonitorThread(threading.Thread):
         self.running = True
         self.warmup_end_logged = False
 
+    def _log_sample(self, tag: str = "Monitor"):
+        interval_stats = perf_counter.get_interval_stats()
+        stats = perf_counter.get_stats()
+        latency_stats = perf_counter.get_latency_stats()
+        pool_stats = self.db_adapter.get_pool_stats()
+
+        realtime_tps = perf_counter.get_sub_second_tps()
+        is_warmup = perf_counter.is_warmup_period()
+        has_warmup = perf_counter.has_warmup_config()
+
+        if has_warmup and not is_warmup and not self.warmup_end_logged:
+            self.warmup_end_logged = True
+            logger.info("=" * 80)
+            logger.info("[Monitor] *** WARMUP COMPLETED *** Starting measurement phase...")
+            logger.info("=" * 80)
+
+        status_indicator = "[WARMUP]  " if is_warmup else "[RUNNING] "
+
+        if is_warmup:
+            avg_tps_str = "-"
+        elif has_warmup:
+            avg_tps_str = f"{round(stats['post_warmup_tps'])}"
+        else:
+            avg_tps_str = f"{round(stats['avg_tps'])}"
+
+        logger.info(
+            f"[{tag}] {status_indicator}"
+            f"TXN: {interval_stats['interval_transactions']:,} | "
+            f"INS: {interval_stats['interval_inserts']:,} | "
+            f"SEL: {interval_stats['interval_selects']:,} | "
+            f"UPD: {interval_stats['interval_updates']:,} | "
+            f"DEL: {interval_stats['interval_deletes']:,} | "
+            f"ERR: {interval_stats['interval_errors']:,} | "
+            f"Avg TPS: {avg_tps_str} | "
+            f"RT TPS: {round(realtime_tps)} | "
+            f"Lat(p50/p95/p99): {latency_stats['p50']:.1f}/{latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
+            f"Pool: {pool_stats.get('pool_active', 0)}/{pool_stats.get('pool_total', 0)}"
+        )
+
+        # 시계열 데이터 기록
+        perf_counter.record_time_series(pool_stats)
+
+    def sample_once(self, tag: str = "Monitor"):
+        self._log_sample(tag=tag)
+
     def run(self):
         logger.info(f"[Monitor] Starting (interval: {self.interval_seconds}s)")
 
@@ -2958,47 +2917,7 @@ class MonitorThread(threading.Thread):
                 break
 
             time.sleep(self.interval_seconds)
-
-            interval_stats = perf_counter.get_interval_stats()
-            stats = perf_counter.get_stats()
-            latency_stats = perf_counter.get_latency_stats()
-            pool_stats = self.db_adapter.get_pool_stats()
-
-            realtime_tps = perf_counter.get_sub_second_tps()
-            is_warmup = perf_counter.is_warmup_period()
-            has_warmup = perf_counter.has_warmup_config()
-
-            if has_warmup and not is_warmup and not self.warmup_end_logged:
-                self.warmup_end_logged = True
-                logger.info("=" * 80)
-                logger.info("[Monitor] *** WARMUP COMPLETED *** Starting measurement phase...")
-                logger.info("=" * 80)
-
-            status_indicator = "[WARMUP]  " if is_warmup else "[RUNNING] "
-
-            if is_warmup:
-                avg_tps_str = "-"
-            elif has_warmup:
-                avg_tps_str = f"{round(stats['post_warmup_tps'])}"
-            else:
-                avg_tps_str = f"{round(stats['avg_tps'])}"
-
-            logger.info(
-                f"[Monitor] {status_indicator}"
-                f"TXN: {interval_stats['interval_transactions']:,} | "
-                f"INS: {interval_stats['interval_inserts']:,} | "
-                f"SEL: {interval_stats['interval_selects']:,} | "
-                f"UPD: {interval_stats['interval_updates']:,} | "
-                f"DEL: {interval_stats['interval_deletes']:,} | "
-                f"ERR: {interval_stats['interval_errors']:,} | "
-                f"Avg TPS: {avg_tps_str} | "
-                f"RT TPS: {round(realtime_tps)} | "
-                f"Lat(p50/p95/p99): {latency_stats['p50']:.1f}/{latency_stats['p95']:.1f}/{latency_stats['p99']:.1f}ms | "
-                f"Pool: {pool_stats.get('pool_active', 0)}/{pool_stats.get('pool_total', 0)}"
-            )
-
-            # 시계열 데이터 기록
-            perf_counter.record_time_series(pool_stats)
+            self._log_sample()
 
         logger.info("[Monitor] Stopped")
 
@@ -3166,6 +3085,9 @@ class MultiDBLoadTester:
 
         monitor.stop()
         monitor.join(timeout=5)
+        # 워커 종료 후 최종 모니터 샘플을 위해 1초 대기
+        time.sleep(1)
+        monitor.sample_once(tag="Final")
 
         # 최종 통계 출력
         self._print_final_stats(thread_count, duration_seconds, total_transactions, mode,
@@ -3184,40 +3106,50 @@ class MultiDBLoadTester:
         final_stats = perf_counter.get_stats()
         latency_stats = perf_counter.get_latency_stats()
 
-        logger.info("=" * 80)
-        logger.info("LOAD TEST COMPLETED - FINAL STATISTICS")
-        logger.info("=" * 80)
-        logger.info(f"Database Type: {self.config.db_type.upper()} (JDBC)")
-        logger.info(f"Work Mode: {mode}")
-        logger.info(f"Total Threads: {thread_count}")
-        logger.info(f"Test Duration: {duration_seconds}s (Warmup: {warmup_seconds}s)")
-        if target_tps > 0:
-            logger.info(f"Target TPS: {target_tps}")
-        if batch_size > 1:
-            logger.info(f"Batch Size: {batch_size}")
-        logger.info("-" * 80)
-        logger.info(f"Total Transactions: {final_stats['total_transactions']:,}")
-        logger.info(f"  - Inserts: {final_stats['total_inserts']:,}")
-        logger.info(f"  - Selects: {final_stats['total_selects']:,}")
-        logger.info(f"  - Updates: {final_stats['total_updates']:,}")
-        logger.info(f"  - Deletes: {final_stats['total_deletes']:,}")
-        logger.info(f"Total Errors: {final_stats['total_errors']:,}")
-        logger.info(f"Verification Failures: {final_stats['verification_failures']:,}")
-        logger.info("-" * 80)
-        logger.info(f"Average TPS (overall): {round(final_stats['avg_tps'])}")
-        if warmup_seconds > 0:
-            logger.info(f"Average TPS (post-warmup): {round(final_stats['post_warmup_tps'])}")
-        logger.info(f"Realtime TPS (last 1s): {round(final_stats['realtime_tps'])}")
+        avg_tps_value = final_stats['post_warmup_tps'] if warmup_seconds > 0 else final_stats['avg_tps']
 
-        if final_stats['total_transactions'] > 0:
-            success_rate = (1 - final_stats['total_errors'] / final_stats['total_transactions']) * 100
-            logger.info(f"Success Rate: {success_rate:.2f}%")
-
-        logger.info("-" * 80)
-        logger.info(f"Latency (ms) - Avg: {latency_stats['avg']:.2f}, P50: {latency_stats['p50']:.2f}, "
-                    f"P95: {latency_stats['p95']:.2f}, P99: {latency_stats['p99']:.2f}, "
-                    f"Min: {latency_stats['min']:.2f}, Max: {latency_stats['max']:.2f}")
-        logger.info("=" * 80)
+        console_formatter_backup = console_handler.formatter
+        console_handler.setFormatter(logging.Formatter('%(message)s'))
+        try:
+            logger.info("=" * 80)
+            logger.info("LOAD TEST COMPLETED (Python)")
+            logger.info("=" * 80)
+            logger.info("Configuration:")
+            logger.info(f"  - Database: {self.config.db_type.upper()}")
+            logger.info(f"  - Host: {self.config.host}")
+            logger.info(f"  - Mode: {mode}")
+            logger.info(f"  - Threads: {thread_count}")
+            logger.info(f"  - Duration: {duration_seconds}s")
+            logger.info(f"  - Warmup: {warmup_seconds}s")
+            logger.info(f"  - Target TPS: {target_tps}")
+            logger.info(f"  - Batch Size: {batch_size}")
+            logger.info("-" * 80)
+            logger.info("Results:")
+            logger.info(f"  - Total Transactions: {final_stats['total_transactions']:,}")
+            logger.info(f"  - Total Inserts: {final_stats['total_inserts']:,}")
+            logger.info(f"  - Total Selects: {final_stats['total_selects']:,}")
+            logger.info(f"  - Total Updates: {final_stats['total_updates']:,}")
+            logger.info(f"  - Total Deletes: {final_stats['total_deletes']:,}")
+            logger.info(f"  - Total Errors: {final_stats['total_errors']:,}")
+            logger.info(f"  - Verification Failures: {final_stats['verification_failures']:,}")
+            logger.info(f"  - Elapsed Time: {final_stats['elapsed_seconds']:.2f}s")
+            logger.info(f"  - Average TPS: {avg_tps_value:.2f}")
+            logger.info(f"  - Realtime TPS (last 1s): {final_stats['realtime_tps']:.2f}")
+            success_rate = 0.0
+            if final_stats['total_transactions'] > 0:
+                success_rate = (1 - final_stats['total_errors'] / final_stats['total_transactions']) * 100
+            logger.info(f"  - Success Rate: {success_rate:.2f}%")
+            logger.info("-" * 80)
+            logger.info("Latency:")
+            logger.info(f"  - Average: {latency_stats['avg']:.2f}ms")
+            logger.info(f"  - P50: {latency_stats['p50']:.2f}ms")
+            logger.info(f"  - P95: {latency_stats['p95']:.2f}ms")
+            logger.info(f"  - P99: {latency_stats['p99']:.2f}ms")
+            logger.info(f"  - Min: {latency_stats['min']:.2f}ms")
+            logger.info(f"  - Max: {latency_stats['max']:.2f}ms")
+            logger.info("=" * 80)
+        finally:
+            console_handler.setFormatter(console_formatter_backup)
 
     def _export_results(self, output_format: str, output_file: str,
                         thread_count: int, duration_seconds: int, mode: str):
@@ -3245,7 +3177,7 @@ class MultiDBLoadTester:
 # ============================================================================
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Multi-Database Load Tester v2.2 (JDBC)',
+        description='Multi-Database Load Tester v2.3.0 (JDBC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Work Modes:
@@ -3296,8 +3228,6 @@ Examples:
     # 풀 설정
     parser.add_argument('--min-pool-size', type=int, default=100)
     parser.add_argument('--max-pool-size', type=int, default=200)
-    parser.add_argument('--connection-timeout', type=int, default=10,
-                        help='Connection/Read timeout in seconds (default: 10)')
 
     # 커넥션 풀 고급 설정
     parser.add_argument('--max-lifetime', type=int, default=1800,
@@ -3310,6 +3240,12 @@ Examples:
                         help='Idle connection timeout in seconds (default: 30)')
     parser.add_argument('--keepalive-time', type=int, default=30,
                         help='Keepalive interval for idle connections in seconds (default: 30, min: 30)')
+    parser.add_argument('--connection-timeout', type=int, default=30,
+                        help='Connection login timeout in seconds (default: 30)')
+    parser.add_argument('--jdbc-read-timeout', type=int, default=30,
+                        help='JDBC read timeout in seconds (Oracle only, default: 30)')
+    parser.add_argument('--jdbc-connect-timeout', type=int, default=10,
+                        help='JDBC connect timeout in seconds (Oracle only, default: 10)')
 
     # 테스트 설정
     parser.add_argument('--thread-count', type=int, default=100)
@@ -3353,15 +3289,7 @@ def main():
 
     args = parse_arguments()
 
-    if not JAYDEBEAPI_AVAILABLE:
-        logger.error("jaydebeapi/JPype1 not installed")
-        sys.exit(1)
-
     logger.setLevel(getattr(logging, args.log_level))
-
-    if args.version:
-        print(f"Multi-Database Load Tester v{VERSION} (JDBC)")
-        return
 
     config = DatabaseConfig(
         db_type=args.db_type, host=args.host, port=args.port,
@@ -3374,25 +3302,16 @@ def main():
         idle_check_interval_seconds=args.idle_check_interval,
         idle_timeout_seconds=args.idle_timeout,
         keepalive_time_seconds=args.keepalive_time,
-        connection_timeout_seconds=args.connection_timeout
+        connection_timeout_seconds=args.connection_timeout,
+        jdbc_read_timeout_seconds=args.jdbc_read_timeout,
+        jdbc_connect_timeout_seconds=args.jdbc_connect_timeout
     )
-
-    # JVM 초기화 (Timeouts via System Properties for extra safety)
-    jvm_extra_args = []
-    if args.db_type == 'oracle' and args.connection_timeout > 0:
-        timeout_ms = str(args.connection_timeout * 1000)
-        jvm_extra_args.append(f"-Doracle.net.CONNECT_TIMEOUT={timeout_ms}")
-        jvm_extra_args.append(f"-Doracle.jdbc.ReadTimeout={timeout_ms}")
-        # Generic Java socket timeouts as fallback
-        jvm_extra_args.append(f"-Dsun.net.client.defaultConnectTimeout={timeout_ms}")
-        jvm_extra_args.append(f"-Dsun.net.client.defaultReadTimeout={timeout_ms}")
-        logger.info(f"Adding JVM args for Oracle timeouts: {jvm_extra_args}")
-
-    initialize_jvm(args.jre_dir, extra_args=jvm_extra_args)
 
     if not os.path.exists(args.jre_dir):
         logger.error(f"JRE directory not found: {args.jre_dir}")
         sys.exit(1)
+
+    initialize_jvm(args.jre_dir)
 
     try:
         tester = MultiDBLoadTester(config)

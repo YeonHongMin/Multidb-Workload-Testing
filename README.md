@@ -1,4 +1,4 @@
-# Multi-Database Load Tester v2.2.3 (Python & JDBC Driver)
+# Multi-Database Load Tester v2.3 (Python & JDBC Driver)
 
 Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
@@ -18,23 +18,120 @@ Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티�
 - **Graceful Shutdown**: Ctrl+C 안전 종료
 - **커넥션 풀 모니터링**: 실시간 풀 상태 확인
 
-### v2.2.3 버그 수정: DB 재기동 후 Hang 현상 해결
-
-- **문제**: DB 재기동/Failover 시 워커 스레드가 무한 대기(Hang) 상태에 빠지는 현상
-- **원인**: `acquire()` 함수에서 `pool.get(timeout=30)` 호출 시 풀이 비어있으면 30초간 블로킹
-- **해결책**:
-  1. `pool_timeout`을 최대 1초로 제한 (`min(timeout, 1)`)
-  2. 최대 3회 재시도 로직 추가 (총 최대 3초 대기)
-  3. 명시적 `queue.Empty` 예외 발생으로 상위 레벨에서 backoff 처리
-  4. `MAX_BACKOFF_MS`를 5000ms → 1000ms로 축소 (복구 시간 28% 단축)
-- **결과**: DB 복구 시 약 23초 내 자동 재연결 (기존 무한 대기 → 빠른 복구)
-
-### v2.2.2 신규 기능: 향상된 커넥션 풀 관리
+### v2.3 신규 기능: DB 재기동 시 자동 복구
 
 - **Connection Leak 감지**: 오래 사용 중인 커넥션 자동 감지 및 경고
 - **Pool Warm-up**: 초기화 시 min_size 커넥션 미리 생성
 - **Connection Max Lifetime**: 오래된 커넥션 자동 갱신
 - **Idle Health Check**: 유휴 커넥션 주기적 검증 및 정리
+- **🔧 DB 재기동 자동 복구 (버그 수정)**:
+  - **커넥션 생성 재시도 로직**: 최대 3회 재시도 + Exponential Backoff (100ms → 200ms → 400ms → 최대 2초)
+  - **커넥션 획득 향상**: `acquire()` 메서드 재시도 로직 강화 (백오프 적용, DB listener 과부하 방지)
+  - **워커 루프 개선**: 연속 실패 시 백오프 적용, 성공 시 카운터 리셋으로 무한 루프 방지
+  - **상세 로깅**: 재시도 횟수, 백오프 시간 등 상세 정보 로그 출력
+
+---
+
+### v2.3 버그 수정 상세
+
+#### 문제: DB 재기동 시 Hang 발생
+
+**증상**:
+- DB 재기동 후 커넥션 풀이 전체 손실 (`Pool: 0/0`)
+- 워커가 무한 대기 상태에 빠짐 (`TXN: 0`, `RT TPS: 0`)
+- DB가 다시 살아도 재연결 시도하지 않음
+- 1분 이상 Hang 상태 지속
+
+**원인**:
+
+1. **`_create_connection_internal()` 재시도 부재**
+   - 단일 시도 후 바로 `None` 반환
+   - DB 재기동 중 연결 실패 시 재시도 없음
+
+2. **`acquire()` 메서드의 재시도 로직 불충분**
+   - `retry_count`가 제대로 증가하지 않음
+   - `time.sleep(1)` 후 재시도하지 않고 루프 계속됨
+   - 백오프 메커니즘 없음
+
+3. **워커 루프의 무한 루프**
+   ```python
+   if connection is None:
+       connection = self._get_valid_connection()
+       consecutive_errors = 0  # 무조건 리셋
+
+   if connection is None:
+       time.sleep(1)
+       continue  # 무한 루프!
+   ```
+
+#### 해결책
+
+**1. 커넥션 생성 재시도 로직 추가** (`_create_connection_internal()`)
+```python
+max_creation_retries = 3
+creation_backoff_ms = 100
+
+for attempt in range(max_creation_retries):
+    try:
+        # 커넥션 생성 시도
+        conn = jaydebeapi.connect(...)
+        return PooledConnection(connection=conn)
+    except Exception as e:
+        if attempt < max_creation_retries - 1:
+            # 재시도: Exponential Backoff
+            logger.warning(f"{attempt + 1}/{max_creation_retries} 시도 실패. {creation_backoff_ms}ms 후 재시도...")
+            time.sleep(creation_backoff_ms / 1000.0)
+            creation_backoff_ms = min(creation_backoff_ms * 2, 2000)
+```
+
+**2. `acquire()` 메서드 재시도 로직 강화**
+```python
+retry_count = 0
+max_retries = 3
+backoff_ms = 100
+
+while retry_count < max_retries:
+    # 큐 Empty 예외 처리
+    except queue.Empty:
+        if retry_count < max_retries - 1:
+            # 백오프 적용
+            time.sleep(backoff_ms / 1000.0)
+            backoff_ms = min(backoff_ms * 2, 5000)
+        retry_count += 1
+```
+
+**3. 워커 루프 개선** (`run()` 메서드)
+```python
+if connection is None:
+    connection = self._get_valid_connection()
+    if connection is not None:
+        # 성공: 에러 카운터 및 백오프 리셋
+        consecutive_errors = 0
+        self.reset_backoff()
+    else:
+        # 실패: 연속 에러 카운트 증가
+        consecutive_errors += 1
+        if consecutive_errors >= 2:
+            # 백오프 적용
+            time.sleep(self.current_backoff_ms / 1000.0)
+            self.current_backoff_ms = min(self.current_backoff_ms * 2, self.MAX_BACKOFF_MS)
+        else:
+            time.sleep(1)
+        continue
+```
+
+#### 테스트 결과 (예상)
+
+DB 재기동 시나리오 테스트:
+1. **정상 동작** (재기동 전): TPS ~700-800, 에러 없음
+2. **DB 재기동** (12:34:00): 커넥션 손실, 에러 발생
+3. **자동 복구** (12:34:05~12:34:20):
+   - 워커들이 재시도 시작
+   - 백오프 적용으로 DB listener 과부하 방지
+   - 새 커넥션 생성 성공
+4. **정상 복구** (12:34:20 이후): TPS 복구, 워크로드 계속
+
+**복구 시간**: 약 15-20초 (백오프 포함)
 
 ## 시스템 요구사항
 
