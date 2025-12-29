@@ -6,7 +6,7 @@
 |------|-------------|
 | 문서 버전 | 1.0 |
 | 프로젝트 이름 | 멀티 데이터베이스 워크로드 테스트 도구 |
-| 현재 버전 | v2.3 |
+| 현재 버전 | v2.4 |
 | 최종 업데이트 | 2025-12-29 |
 | 문서 관리자 | 개발팀 |
 
@@ -579,6 +579,86 @@ UPDATE DB CFG FOR testdb USING NEWLOGPATH /db2/logs/testdb/;
 
 ---
 
+### 3.7 SingleStore 최적화
+
+#### 3.7.1 파라미터 튜닝
+
+```sql
+-- 메모리 설정
+SET GLOBAL max_memory = 4G;
+SET GLOBAL maximum_memory = 4G;
+
+-- 연결 수 증가
+SET GLOBAL max_connections = 500;
+
+-- 스레드 설정
+SET GLOBAL resource_governor_default_threadpool_size = 200;
+SET GLOBAL resource_governor_default_threadpool_max_size = 400;
+```
+
+#### 3.7.2 파티셔닝 활용
+
+```sql
+-- HASH 파티셔닝 (도구가 자동 생성)
+CREATE TABLE test_table (
+    id BIGINT AUTO_INCREMENT,
+    thread_id VARCHAR(50),
+    ...
+    PRIMARY KEY (id, thread_id),
+    KEY (thread_id),
+    SHARD KEY (thread_id)
+) PARTITION BY HASH (thread_id) PARTITIONS 16;
+```
+
+**특이사항**:
+- SingleStore는 기본적으로 분산 아키텍처
+- SHARD KEY 사용으로 데이터 분산 최적화
+- 자동 파티셔닝 및 샤딩
+
+#### 3.7.3 컬럼스토어 최적화
+
+```sql
+-- 컬럼스토어 테이블 생성 (읽기 최적화)
+CREATE TABLE test_table_columnstore (
+    id BIGINT,
+    thread_id VARCHAR(50),
+    ...
+    KEY (thread_id)
+) WITH (COLUMNSTORE = TRUE);
+
+-- 행기반 테이블 (쓰기 최적화)
+CREATE TABLE test_table_rowstore (
+    id BIGINT,
+    thread_id VARCHAR(50),
+    ...
+    PRIMARY KEY (id)
+) WITH (ROWSTORE = TRUE);
+```
+
+#### 3.7.4 인덱스 최적화
+
+```sql
+-- 인덱스 생성
+CREATE INDEX idx_thread_id ON test_table(thread_id);
+CREATE INDEX idx_created_at ON test_table(created_at);
+
+-- 컬럼스토어 인덱스
+CREATE INDEX idx_thread_id_col ON test_table_columnstore(thread_id);
+```
+
+#### 3.7.5 커넥터/J 최적화
+
+SingleStore는 MySQL Connector/J를 사용하므로 MySQL과 동일한 최적화가 적용됩니다:
+
+```bash
+# JDBC URL 파라미터
+jdbc:singlestore://host:3306/db?useSSL=false&allowPublicKeyRetrieval=true&useServerPrepStmts=true&cachePrepStmts=true&prepStmtCacheSize=250&prepStmtCacheSqlLimit=2048&useLocalSessionState=true&rewriteBatchedStatements=true&cacheResultSetMetadata=true&cacheServerConfiguration=true&elideSetAutoCommits=true&maintainTimeStats=false&maxPoolSize=32
+```
+
+**특이사항**: MySQL과 동일하게 최대 풀 크기가 32로 제한됩니다.
+
+---
+
 ## 4. 네트워크 최적화
 
 ### 4.1 TCP 튜닝
@@ -926,6 +1006,7 @@ stats.print_stats(20)
 - **SQL Server**: SQL Server Performance Tuning
 - **Tibero**: Tibero Performance Guide
 - **IBM DB2**: DB2 Performance Tuning
+- **SingleStore**: SingleStore Performance Tuning
 
 ### 9.2 관련 문서
 

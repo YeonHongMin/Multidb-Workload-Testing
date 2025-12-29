@@ -1,12 +1,12 @@
-# Multi-Database Load Tester v2.3 (Python & JDBC Driver)
+# Multi-Database Load Tester v2.4 (Python & JDBC Driver)
 
-Oracle, PostgreSQL, MySQL, SQL Server, Tibero를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
+Oracle, PostgreSQL, MySQL, SQL Server, Tibero, SingleStore를 지원하는 고성능 멀티스레드 데이터베이스 부하 테스트 도구
 
 *** DownLoad Link(with JDBC Drivers) : https://drive.google.com/file/d/1Qq_dkVJuYcmU1kBbeQT8Khr0W4Xk4XGs/view?usp=sharing
 
 ## 주요 특징
 
-- **5개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero
+- **6개 데이터베이스 지원**: Oracle, PostgreSQL, MySQL, SQL Server, Tibero, SingleStore
 - **JDBC 드라이버 사용**: JayDeBeApi를 통한 통합 JDBC 연결
 - **고성능 멀티스레딩**: 최대 1000개 동시 세션 지원
 - **6가지 작업 모드**: full, insert-only, select-only, update-only, delete-only, mixed
@@ -145,6 +145,7 @@ DB 재기동 시나리오 테스트:
   - MySQL 5.7+
   - SQL Server 2016+
   - Tibero 6+
+  - SingleStore 8.0+
 
 ## 설치
 
@@ -170,8 +171,10 @@ JDBC 드라이버는 `./jre/<db_type>/*.jar`에 배치합니다:
 │   └── postgresql-42.7.0.jar
 ├── mysql/
 │   └── mysql-connector-j-8.0.33.jar
-└── sqlserver/
-    └── mssql-jdbc-12.4.0.jre11.jar
+├── sqlserver/
+│   └── mssql-jdbc-12.4.0.jre11.jar
+└── singlestore/
+    └── singlestore-jdbc-1.2.1.jar
 ```
 
 ## Linux client/server 실행 절차
@@ -182,7 +185,7 @@ JDBC 드라이버는 `./jre/<db_type>/*.jar`에 배치합니다:
 
 - DB 서버에 대상 DB 설치/구동, 사용자 계정/비밀번호 준비
 - 클라이언트에서 DB 포트 접근 가능하도록 방화벽/보안그룹 설정
-- 예: Oracle 1521, PostgreSQL 5432, MySQL 3306, SQL Server 1433, Tibero 8629
+- 예: Oracle 1521, PostgreSQL 5432, MySQL 3306, SQL Server 1433, Tibero 8629, SingleStore 3306
 
 ### 2) 클라이언트 준비 (Linux)
 
@@ -395,13 +398,24 @@ python multi_db_load_tester_jdbc.py \
     --thread-count 200
 ```
 
+#### SingleStore
+
+```bash
+python multi_db_load_tester_jdbc.py \
+    --db-type singlestore \
+    --host localhost --port 3306 --database testdb \
+    --user root --password pass \
+    --truncate \
+    --thread-count 200
+```
+
 ## 명령행 옵션
 
 ### 필수 옵션
 
 | 옵션         | 설명                                                             |
 | ------------ | ---------------------------------------------------------------- |
-| `--db-type`  | 데이터베이스 타입 (oracle, postgresql, mysql, sqlserver, tibero) |
+| `--db-type`  | 데이터베이스 타입 (oracle, postgresql, mysql, sqlserver, tibero, singlestore) |
 | `--host`     | 데이터베이스 호스트                                              |
 | `--user`     | 사용자명                                                         |
 | `--password` | 비밀번호                                                         |
@@ -600,6 +614,7 @@ Connection held for 65.3s by thread 'Worker-0001' (threshold: 60s)
 | MySQL      | mysql-connector | AUTO_INCREMENT | HASH 16개 | 최대 32개 |
 | SQL Server | mssql-jdbc      | IDENTITY       | -         | -         |
 | Tibero     | tibero-jdbc     | SEQUENCE       | HASH 16개 | -         |
+| SingleStore| singlestore-jdbc| AUTO_INCREMENT | HASH 16개 | 최대 32개 |
 
 ## 환경 변수 설정
 
@@ -631,6 +646,7 @@ chmod +x run_*.sh
 ./run_mysql_jdbc_test.sh
 ./run_sqlserver_jdbc_test.sh
 ./run_tibero_jdbc_test.sh
+./run_singlestore_jdbc_test.sh
 ```
 
 ## Graceful Shutdown

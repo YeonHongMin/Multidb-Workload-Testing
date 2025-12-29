@@ -6,7 +6,7 @@
 |------|-------------|
 | 문서 버전 | 1.0 |
 | 프로젝트 이름 | 멀티 데이터베이스 워크로드 테스트 도구 |
-| 현재 버전 | v2.3 |
+| 현재 버전 | v2.4 |
 | 최종 업데이트 | 2025-12-29 |
 | 문서 관리자 | 개발팀 |
 
@@ -17,7 +17,7 @@
 이 문서는 멀티 데이터베이스 워크로드 테스트 도구의 API 인터페이스를 상세하게 설명합니다. 현재 이 도구는 명령줄 인터페이스(CLI)를 통해 제공되며, 향후 REST API를 추가할 예정입니다.
 
 ### 1.1 API 유형
-- **CLI API**: 현재 버전(v2.3)에서 제공되는 명령줄 인터페이스
+- **CLI API**: 현재 버전(v2.4)에서 제공되는 명령줄 인터페이스
 - **REST API**: 향후 버전(v3.0+)에서 계획된 웹 기반 API
 
 ---
@@ -42,6 +42,7 @@ python multi_db_load_tester_jdbc.py [필수 인수] [옵션]
 - `sqlserver`: Microsoft SQL Server
 - `tibero`: Tibero 데이터베이스
 - `db2`: IBM DB2 데이터베이스
+- `singlestore`: SingleStore 데이터베이스
 
 **예시**:
 ```bash
@@ -94,6 +95,7 @@ python multi_db_load_tester_jdbc.py --password secure_password ...
 - SQL Server: 1433
 - Tibero: 8629
 - DB2: 50000
+- SingleStore: 3306
 
 **예시**:
 ```bash
@@ -175,7 +177,7 @@ python multi_db_load_tester_jdbc.py --min-pool-size 50 ...
 
 **범위**: 1-1000
 
-**특이사항**: MySQL의 경우 최대 32로 제장됨 (Connector/J 특성)
+**특이사항**: MySQL 및 SingleStore의 경우 최대 32로 제한됨 (Connector/J 특성)
 
 **예시**:
 ```bash
@@ -594,6 +596,19 @@ python multi_db_load_tester_jdbc.py \
   --test-duration 300
 ```
 
+#### SingleStore 테스트
+```bash
+python multi_db_load_tester_jdbc.py \
+  --db-type singlestore \
+  --host singlestore.example.com \
+  --port 3306 \
+  --database testdb \
+  --user testuser \
+  --password testpass \
+  --thread-count 100 \
+  --test-duration 300
+```
+
 ### 3.2 고급 사용 예제
 
 #### 속도 제한이 있는 테스트
@@ -664,7 +679,7 @@ python multi_db_load_tester_jdbc.py \
 #### 실시간 모니터링
 ```
 14:32:15 - ========================================
-14:32:15 - 멀티 데이터베이스 워크로드 테스트 도구 v2.3
+14:32:15 - 멀티 데이터베이스 워크로드 테스트 도구 v2.4
 14:32:15 - ========================================
 14:32:15 - 연결 풀 초기화 중...
 14:32:15 - 풀 상태: 100/200 (활성/총)
@@ -716,7 +731,7 @@ P99: 189.7
 ```csv
 # 테스트 메타데이터
 테스트 타임스탬프,2025-12-29 14:32:15
-버전,2.3
+버전,2.4
 데이터베이스,postgresql
 호스트,postgres.example.com
 포트,5432
@@ -765,7 +780,7 @@ P99,189.7
 {
   "test_metadata": {
     "timestamp": "2025-12-29 14:32:15",
-    "version": "2.3",
+    "version": "2.4",
     "database": "postgresql",
     "host": "postgres.example.com",
     "port": 5432,
@@ -1013,6 +1028,11 @@ bash run_tibero_jdbc_test.sh
 #### DB2
 ```bash
 bash run_db2_jdbc_test.sh
+```
+
+#### SingleStore
+```bash
+bash run_singlestore_jdbc_test.sh
 ```
 
 ---
